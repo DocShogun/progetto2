@@ -40,26 +40,74 @@ class MaxstreamExtractor:
             self.session = ClientSession(timeout=timeout, connector=connector, headers={'User-Agent': self.base_headers["user-agent"]})
         return self.session
 
+    async def _resolve_doh(self, domain: str) -> list[str]:
+        """Resolve domain using DNS-over-HTTPS (Google) to bypass local DNS hijacking."""
+        try:
+            # Using Google DoH API
+            url = f"https://dns.google/resolve?name={domain}&type=A"
+            async with ClientSession(timeout=ClientTimeout(total=5)) as session:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        ips = [ans['data'] for ans in data.get('Answer', []) if ans.get('type') == 1]
+                        if ips:
+                            logger.info(f"DoH resolved {domain} to {ips}")
+                            return ips
+        except Exception as e:
+            logger.debug(f"DoH resolution failed for {domain}: {e}")
+        return []
+
     async def _smart_request(self, url: str, method="GET", **kwargs):
-        """Request with automatic retry using different proxies on connection failure."""
+        """Request with automatic retry using different proxies and DoH fallback on connection failure."""
         last_error = None
+        parsed_url = urlparse(url)
+        domain = parsed_url.netloc
         
-        # Try direct or with current session first
-        proxies_to_try = [None] + (self.proxies if self.proxies else [])
+        # Determine paths to try: Direct, Proxies, and then DoH for each
+        paths = []
+        # Path 1: Direct
+        paths.append({"proxy": None, "use_ip": None})
         
-        for proxy in proxies_to_try:
+        # Path 2: Proxies (if any)
+        if self.proxies:
+            for p in self.proxies:
+                paths.append({"proxy": p, "use_ip": None})
+        
+        # Path 3: DoH fallback (direct to IP) if it's uprot or maxstream
+        if "uprot.net" in domain or "maxstream" in domain:
+            real_ips = await self._resolve_doh(domain)
+            for ip in real_ips[:2]: # Try first 2 IPs
+                paths.append({"proxy": None, "use_ip": ip})
+        
+        for path in paths:
+            proxy = path["proxy"]
+            use_ip = path["use_ip"]
+            
+            request_url = url
+            headers = kwargs.get("headers", {}).copy()
+            
+            if use_ip:
+                # Replace domain with IP in URL
+                request_url = url.replace(domain, use_ip)
+                # Keep Host header for SNI and HTTP virtual hosting
+                headers["Host"] = domain
+                logger.info(f"Attempting DoH connection to {domain} via IP {use_ip}")
+
             session = await self._get_session(proxy=proxy)
             try:
-                async with session.request(method, url, **kwargs) as response:
-                    text = await response.text()
+                # Disable SSL verification when connecting via IP to avoid certificate mismatch 
+                # (though Host header should fix it, sometimes it's tricky with common libs)
+                ssl_ctx = False if use_ip else None
+                
+                async with session.request(method, request_url, headers=headers, ssl=ssl_ctx, **kwargs) as response:
                     if response.status < 400:
-                        if proxy: # Clean up temporary proxy session
-                            await session.close()
+                        text = await response.text()
+                        if proxy: await session.close()
                         return text
                     else:
-                        logger.warning(f"Request to {url} failed with status {response.status} using proxy {proxy}")
+                        logger.warning(f"Request to {url} failed (Status {response.status}) [Proxy: {proxy}, IP: {use_ip}]")
             except Exception as e:
-                logger.warning(f"Request to {url} failed with error {e} using proxy {proxy}")
+                logger.warning(f"Request to {url} failed (Error: {e}) [Proxy: {proxy}, IP: {use_ip}]")
                 last_error = e
             finally:
                 if proxy and 'session' in locals() and not session.closed:
