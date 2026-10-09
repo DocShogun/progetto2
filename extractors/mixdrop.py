@@ -1,128 +1,199 @@
+import asyncio
 import logging
-import random
-from aiohttp import ClientSession, ClientTimeout, TCPConnector
-from aiohttp_socks import ProxyConnector
-from utils.packed import eval_solver
+import re
+import time
+from urllib.parse import urlparse, urljoin
+
+from curl_cffi.requests import AsyncSession
+from bs4 import BeautifulSoup
+
+import config as _cfg
+from extractors.base import BaseExtractor
+from utils.cookie_cache import CookieCache
 
 logger = logging.getLogger(__name__)
 
 class ExtractorError(Exception):
     pass
 
-class MixdropExtractor:
-    """Mixdrop URL extractor."""
+class MixdropExtractor(BaseExtractor):
+    _result_cache = {}
+    _cache_ttl = 600
+    _cache_max_entries = 30
 
-    def __init__(self, request_headers: dict, proxies: list = None):
-        self.request_headers = request_headers
-        self.base_headers = {
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
-        }
-        self.session = None
+    @classmethod
+    def _prune_result_cache(cls):
+        now = time.time()
+        expired = [key for key, (_, ts) in cls._result_cache.items() if now - ts >= cls._cache_ttl]
+        for key in expired:
+            cls._result_cache.pop(key, None)
+        while len(cls._result_cache) > cls._cache_max_entries:
+            oldest = min(cls._result_cache, key=lambda k: cls._result_cache[k][1])
+            cls._result_cache.pop(oldest, None)
+
+    def __init__(self, request_headers: dict = None, proxies: list = None, bypass_warp: bool = False):
+        super().__init__(request_headers or {}, proxies, extractor_name="mixdrop")
+        self.request_headers = request_headers or {}
+        self.base_headers = self.request_headers.copy()
+        if "User-Agent" not in self.base_headers and "user-agent" not in self.base_headers:
+             self.base_headers["User-Agent"] = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        self.proxies = proxies or _cfg.GLOBAL_PROXIES
+        self.cookie_cache = CookieCache("universal")
         self.mediaflow_endpoint = "proxy_stream_endpoint"
-        self.proxies = proxies or []
+        self.bypass_warp_active = bypass_warp
 
-    def _get_random_proxy(self):
-        return random.choice(self.proxies) if self.proxies else None
+    def _step_headers(self, ua: str, referer: str | None = None) -> dict:
+        headers = {"User-Agent": ua}
+        if referer:
+            headers["Referer"] = referer
+        return headers
 
-    async def _get_session(self):
-        if self.session is None or self.session.closed:
-            timeout = ClientTimeout(total=60, connect=30, sock_read=30)
-            proxy = self._get_random_proxy()
-            if proxy:
-                connector = ProxyConnector.from_url(proxy)
-            else:
-                connector = TCPConnector(limit=0, limit_per_host=0, keepalive_timeout=60, enable_cleanup_closed=True, force_close=False, use_dns_cache=True)
-
-            self.session = ClientSession(timeout=timeout, connector=connector, headers={'User-Agent': self.base_headers["user-agent"]})
-        return self.session
+    def _unpack(self, packed_js: str) -> str:
+        try:
+            match = re.search(r'}\(\'(.*)\',(\d+),(\d+),\'(.*)\'\.split\(\'\|\'\)', packed_js)
+            if not match:
+                match = re.search(r'\}\(([\s\S]*?),\s*(\d+),\s*(\d+),\s*\'([\s\S]*?)\'\.split\(\'\|\'\)', packed_js)
+            if not match: return packed_js
+            p, a, c, k = match.groups()
+            p = p.strip("'\"")
+            a, c, k = int(a), int(c), k.split('|')
+            def e(c):
+                res = ""
+                if c >= a: res = e(c // a)
+                return res + "0123456789abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"[c % a]
+            d = {e(i): (k[i] if k[i] else e(i)) for i in range(c)}
+            for i in range(c):
+                if str(i) not in d: d[str(i)] = k[i] if k[i] else str(i)
+            return re.sub(r'\b(\w+)\b', lambda m: d.get(m.group(1), m.group(1)), p)
+        except Exception as e:
+            logger.debug(f"Unpack failed: {e}")
+            return packed_js
 
     async def extract(self, url: str, **kwargs) -> dict:
-        """Extract Mixdrop URL."""
-        session = await self._get_session()
-        
-        # Handle wrappers like stayonline.pro
-        if "stayonline.pro" in url:
-            try:
-                link_id = url.rstrip("/").split("/")[-1]
-                async with session.post(
-                    "https://stayonline.pro/ajax/linkView.php",
-                    data={"id": link_id},
-                    headers={
-                        "X-Requested-With": "XMLHttpRequest",
-                        "Referer": url,
-                        "User-Agent": self.base_headers["user-agent"]
-                    }
-                ) as resp:
-                    data = await resp.json()
-                    if data.get("status") == "success":
-                        new_url = data["data"]["value"]
-                        logger.info(f"Resolved stayonline.pro wrapper: {url} -> {new_url}")
-                        url = new_url
-                    else:
-                        logger.warning(f"Failed to resolve stayonline.pro wrapper: {data.get('message')}")
-            except Exception as e:
-                logger.error(f"Error resolving stayonline.pro wrapper: {e}")
+        normalized_url = url.strip().replace(" ", "%20")
+        self._apply_routing_kwargs(normalized_url, kwargs)
+        cache_key = (normalized_url, self._forced_proxy, self._force_direct, self.bypass_warp_active)
+        MixdropExtractor._prune_result_cache()
+        if cache_key in MixdropExtractor._result_cache:
+            result, timestamp = MixdropExtractor._result_cache[cache_key]
+            if time.time() - timestamp < MixdropExtractor._cache_ttl:
+                logger.info(f"🚀 [Cache Hit] Using cached extraction result for: {normalized_url}")
+                return result
 
-        # Normalize URL and ensure it's an embed URL if possible
-        # Mixdrop mirrors: .co, .to, .ps, .ch, .ag, .gl, .club, .net, .top, .nz
-        if "/f/" in url:
-            url = url.replace("/f/", "/e/")
-        
-        # Keep original domain if it's a known mirror, otherwise default to .ps
-        known_mirrors = ["mixdrop.co", "mixdrop.to", "mixdrop.ps", "mixdrop.ch", "mixdrop.ag", 
-                         "mixdrop.gl", "mixdrop.club", "m1xdrop.net", "mixdrop.top", "mixdrop.nz",
-                         "mdy48tn97.com"]
-        
-        mirror_found = False
-        for mirror in known_mirrors:
-            if mirror in url:
-                mirror_found = True
-                break
-        
-        if not mirror_found and "mixdrop" in url:
-            # Try to force a known good mirror
-            parts = url.split("/")
-            if len(parts) > 2:
-                parts[2] = "mixdrop.ps"
-                url = "/".join(parts)
-
-        headers = {"accept-language": "en-US,en;q=0.5", "referer": url}
-        
-        # Multiple patterns to try in order of likelihood
-        patterns = [
-            r'MDCore.wurl ?= ?\"(.*?)\"',  # Primary pattern
-            r'wurl ?= ?\"(.*?)\"',          # Simplified pattern
-            r'src: ?\"(.*?)\"',             # Alternative pattern
-            r'file: ?\"(.*?)\"',            # Another alternative
-            r'https?://[^\"\']+\.mp4[^\"\']*'  # Direct MP4 URL pattern
-        ]
-
-        session = await self._get_session()
-        
+        logger.info(f"🔍 [Cache Miss] Extracting new link for: {normalized_url}")
+        await self._resolve_proxy(normalized_url)
         try:
-            final_url = await eval_solver(session, url, headers, patterns)
+            ua, cookies = self.base_headers.get("User-Agent"), {}
+            parsed = urlparse(url)
+            path = parsed.path.rstrip("/")
+            for old in ("/f/", "/mix/", "/emb/"):
+                if old in path: path = path.replace(old, "/e/"); break
+            qs = f"?{parsed.query}" if parsed.query else ""
+
+            mixdrop_domains = [
+                "mxdrop.top", "m1xdrop.bz", "m1xdrop.net",
+                "mixdrop.co", "mixdrop.vip",
+                "mixdrop.ch", "mixdrop.ps", "mixdrop.ag",
+            ]
+            mirrors = [f"{parsed.scheme}://{d}{path}{qs}" for d in mixdrop_domains]
             
-            # Validate extracted URL
-            if not final_url or len(final_url) < 10:
-                raise ExtractorError(f"Extracted URL appears invalid: {final_url}")
-            
-            logger.info(f"Successfully extracted Mixdrop URL: {final_url[:50]}...")
-            
-            self.base_headers["referer"] = url
-            return {
-                "destination_url": final_url,
-                "request_headers": self.base_headers,
-                "mediaflow_endpoint": self.mediaflow_endpoint,
-            }
-        except Exception as e:
-            error_message = str(e)
-            # Per errori di video non trovato, non loggare il traceback perché sono errori attesi
-            if "not found" in error_message.lower() or "unavailable" in error_message.lower():
-                logger.warning(f"Mixdrop video not available at {url}: {error_message}")
-            else:
-                logger.error(f"Failed to extract Mixdrop URL from {url}: {error_message}")
-            raise ExtractorError(f"Mixdrop extraction failed: {str(e)}") from e
+            def _build_cs_proxies(pref_p):
+                if not pref_p:
+                    return None
+                return {"http": pref_p, "https": pref_p}
+
+            async def solve_url(current_url, depth=0):
+                if depth > 3: return None
+                try:
+                    m_headers = self._step_headers(ua, current_url)
+                    pref_p = await self._resolve_proxy(current_url)
+                    cs_proxies = _build_cs_proxies(pref_p)
+                    
+                    async def fetch_page():
+                        try:
+                            async with AsyncSession(
+                                impersonate="chrome120",
+                                curl_options=_cfg.get_curl_ipv4_options(pref_p).get("curl_options") or {},
+                            ) as s:
+                                resp = await s.get(
+                                    current_url,
+                                    headers=m_headers,
+                                    timeout=30,
+                                    proxies=cs_proxies,
+                                )
+                                if resp.status_code == 200:
+                                    t = resp.text
+                                    if not any(m in t.lower() for m in ["cf-challenge", "robot", "checking your browser"]):
+                                        return t, str(resp.url), ua, dict(resp.cookies)
+                        except Exception as e:
+                            logger.debug("Mixdrop fetch_page attempt failed: %s", e)
+                            pass
+                        return None
+
+                    async def _process_result(res):
+                        if not res or not res[0]:
+                            return None
+                        html, final_url, ua_res, new_cookies = res
+                        cookies.update(new_cookies)
+                        
+                        if "eval(function(p,a,c,k,e,d)" in html:
+                            for block in re.findall(r'eval\(function\(p,a,c,k,e,d\).*?\}\(.*\)\)', html, re.S):
+                                html += "\n" + self._unpack(block)
+
+                        patterns = [
+                            r'(?:MDCore|vsConfig)\.wurl\s*=\s*["\']([^"\']+)["\']', 
+                            r'source\s*src\s*=\s*["\']([^"\']+)["\']', 
+                            r'file:\s*["\']([^"\']+)["\']', 
+                            r'["\'](https?://[^\s"\']+\.(?:mp4|m3u8)[^\s"\']*)["\']',
+                            r'wurl\s*:\s*["\']([^"\']+)["\']'
+                        ]
+                        for p in patterns:
+                            match = re.search(p, html)
+                            if match:
+                                v_url = match.group(1)
+                                if v_url.startswith("//"): v_url = "https:" + v_url
+                                return self._build_result(v_url, final_url, ua_res, cookies=cookies)
+
+                        soup = BeautifulSoup(html, "lxml")
+                        iframe = soup.find("iframe", src=re.compile(r'/e/|/emb', re.I))
+                        if iframe:
+                            iframe_url = urljoin(final_url, iframe["src"])
+                            return await solve_url(iframe_url, depth + 1)
+
+                        return None
+
+                    direct_res = await fetch_page()
+                    result = await _process_result(direct_res)
+                    if result:
+                        return result
+                except Exception as e:
+                    logger.debug("Mixdrop mirror attempt failed: %s", e)
+                    pass
+                return None
+
+            mirror_tasks = [asyncio.create_task(solve_url(m)) for m in mirrors]
+            try:
+                for mt in asyncio.as_completed(mirror_tasks):
+                    result = await mt
+                    if result:
+                        MixdropExtractor._result_cache[cache_key] = (result, time.time())
+                        MixdropExtractor._prune_result_cache()
+                        return result
+            finally:
+                for mt in mirror_tasks:
+                    if not mt.done():
+                        mt.cancel()
+                await asyncio.gather(*mirror_tasks, return_exceptions=True)
+
+            raise ExtractorError("Mixdrop: Video source not found")
+        finally:
+            pass
+
+    def _build_result(self, video_url: str, referer: str, ua: str, cookies: dict = None) -> dict:
+        headers = {"Referer": referer, "User-Agent": ua, "Origin": f"https://{urlparse(referer).netloc}"}
+        if cookies:
+            headers["Cookie"] = "; ".join([f"{k}={v}" for k, v in cookies.items()])
+        return {"destination_url": video_url, "request_headers": headers, "mediaflow_endpoint": self.mediaflow_endpoint, "bypass_warp": self.bypass_warp_active, "selected_proxy": self.last_used_proxy, "force_direct": self._force_direct}
 
     async def close(self):
-        if self.session and not self.session.closed:
-            await self.session.close()
+        pass

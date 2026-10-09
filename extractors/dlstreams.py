@@ -1,115 +1,203 @@
 import logging
+import socket
 import re
-import time
 import asyncio
-from urllib.parse import urlparse
+import base64
+import json
+import math
+import time
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
+from urllib.parse import urlparse, urljoin
 from typing import Dict, Any
 import aiohttp
 from aiohttp import ClientSession, ClientTimeout, TCPConnector
-from playwright.async_api import TimeoutError as PlaywrightTimeoutError, async_playwright
-from yarl import URL
+
+try:
+    from bs4 import BeautifulSoup
+except ImportError:
+    BeautifulSoup = None
+
+from config import (
+    get_connector_for_proxy,
+    get_preferred_proxy_for_url,
+    get_ordered_proxies_for_url,
+)
+import config as _cfg
+from extractors.base import BaseExtractor
 
 logger = logging.getLogger(__name__)
 
-# Easy to change in one place if the entry domain changes again.
-DLSTREAMS_ENTRY_ORIGIN = "https://dlhd.dad"
+def _decode_barecrop_econfig(enc: str) -> str | None:
+    """Decode window._econfig payload used by barecrop.net embeds (Player 2).
+
+    Port of the _0x1b7ade() function in /assets/stream.js:
+      s = atob(enc) -> split in 4 chunks -> reorder [2,0,3,1] ->
+      strip char at index 3 of each chunk -> atob each -> join ->
+      atob -> JSON {stream_url, stream_url_nop2p, ...}
+    Returns the m3u8 URL or None.
+    """
+    try:
+        if not enc:
+            return None
+        s = base64.b64decode(enc).decode("latin1")
+        n = 4
+        order = [2, 0, 3, 1]
+        chunk_len = math.ceil(len(s) / n)
+        parts = [s[i * chunk_len:(i + 1) * chunk_len] for i in range(n)]
+        arr = [""] * n
+        for i, o in enumerate(order):
+            a = str(parts[i])
+            if len(a) < 4:
+                return None
+            a = a[:3] + a[4:]
+            arr[o] = base64.b64decode(a).decode("latin1")
+        final = base64.b64decode("".join(arr)).decode("utf-8", errors="ignore")
+        cfg = json.loads(final)
+        if isinstance(cfg, dict):
+            url = cfg.get("stream_url") or cfg.get("stream_url_nop2p")
+            if isinstance(url, str) and url.startswith("http"):
+                return url.strip()
+        return None
+    except Exception:
+        return None
 
 class ExtractorError(Exception):
-    """Custom exception for extraction errors."""
     pass
 
-class DLStreamsExtractor:
-    """Extractor for dlhd.dad / dlstreams streams."""
+class DLStreamsExtractor(BaseExtractor):
+    """Extractor for daddy live / dlstreams streams."""
 
-    def __init__(self, request_headers: dict = None, proxies: list = None):
+    # Return before the request layer kills the task at 30s: an unresponsive
+    # dlive.sx would otherwise burn 10s per candidate, hit the outer timeout
+    # and turn concurrent requests into 500s.
+    EXTRACT_BUDGET_SECONDS = 20.0
+    CANDIDATE_TIMEOUT_SECONDS = 6
+    # Players poll the extractor every few seconds. Re-scraping the player
+    # pages on every poll gets the iframe host to answer 429, so reuse a
+    # validated stream URL for a short window instead. When a re-scrape fails,
+    # serve the last known URL only if it still probes alive (never hang the
+    # player 40-50s on a dead playlist) with a small backoff so the failing
+    # host is not hammered. Stale window tracks the signed-token lifetime (~3-4 min).
+    STREAM_CACHE_SECONDS = 30.0
+    STREAM_CACHE_STALE_SECONDS = 300.0
+    STREAM_CACHE_FAIL_BACKOFF_SECONDS = 15.0
+    MAX_HOST_BACKOFF_SECONDS = 3600.0
+
+    def __init__(self, request_headers: dict = None, proxies: list = None, bypass_warp: bool = False):
+        super().__init__(request_headers or {}, proxies, extractor_name="dlstreams")
         self.request_headers = request_headers or {}
-        self.entry_origin = DLSTREAMS_ENTRY_ORIGIN
-        # Runtime-discovered stream origin (learned from browser network responses).
-        # We intentionally avoid hardcoding CDN domains because they rotate frequently.
-        self.stream_origin = self.entry_origin
+        self.entry_origin = ""
+        self.stream_origin = ""
         self.base_headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/147.0.0.0 Safari/537.36",
         }
         self.session = None
+        self._route_sessions = {}
         self.mediaflow_endpoint = "hls_manifest_proxy"
         self.proxies = proxies or []
-        self._browser_key_cache: dict[str, bytes] = {}
-        # We no longer cache the manifest text to ensure live streams are fresh.
-        # self._browser_manifest_cache: dict[str, str] = {}
-        self._browser_failure_cache: dict[str, float] = {}
-        self._browser_channel_locks: dict[str, asyncio.Lock] = {}
-        self._last_working_player: dict[str, str] = {}
-        self._playwright = None
-        self._browser = None
-        self._browser_launch_lock = asyncio.Lock()
-        self._captured_cookies: list[dict] = []
-        # Proactive refresh tracking
-        self._last_session_refresh: dict[str, float] = {}
-        self._refresh_tasks: dict[str, asyncio.Task] = {}
-        self._dynamic_refresh_interval: dict[str, float] = {}
-        # Manifest micro-cache to handle rapid requests
-        self._manifest_cache: dict[str, tuple[str, float]] = {}
+        self.bypass_warp_active = bypass_warp
+        self._inflight_extract_tasks: dict = {}
+        self._stream_cache: dict = {}
+        # host -> monotonic deadline: honour upstream Retry-After instead of
+        # scraping a host that already said "too many requests".
+        self._host_backoff: dict[str, float] = {}
 
-    def _get_browser_lock(self, channel_key: str) -> asyncio.Lock:
-        lock = self._browser_channel_locks.get(channel_key)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._browser_channel_locks[channel_key] = lock
-        return lock
+    @staticmethod
+    def _host_of(url: str) -> str:
+        return (urlparse(url).hostname or "").lower()
 
-    def _is_browser_cooldown_active(self, channel_key: str) -> bool:
-        retry_after = self._browser_failure_cache.get(channel_key, 0)
-        return retry_after > time.time()
+    @classmethod
+    def _parse_retry_after(cls, value: str | None) -> float | None:
+        """Retry-After as delta-seconds or HTTP-date, clamped to a sane range."""
+        raw = str(value or "").strip()
+        if not raw:
+            return None
+        seconds = None
+        if raw.isdigit():
+            seconds = float(raw)
+        else:
+            try:
+                target = parsedate_to_datetime(raw)
+            except (TypeError, ValueError):
+                return None
+            if target is None:
+                return None
+            if target.tzinfo is None:
+                target = target.replace(tzinfo=timezone.utc)
+            seconds = (target - datetime.now(timezone.utc)).total_seconds()
+        if seconds is None:
+            return None
+        return max(1.0, min(float(seconds), cls.MAX_HOST_BACKOFF_SECONDS))
 
-    def _mark_browser_failure(self, channel_key: str, cooldown_seconds: int = 60) -> None:
-        self._browser_failure_cache[channel_key] = time.time() + cooldown_seconds
+    def _host_limited_for(self, url: str) -> float:
+        """Seconds left before this host may be queried again (0 = free)."""
+        deadline = self._host_backoff.get(self._host_of(url), 0.0)
+        return max(0.0, deadline - time.monotonic())
 
-    def _clear_browser_failure(self, channel_key: str) -> None:
-        self._browser_failure_cache.pop(channel_key, None)
+    def _mark_host_limited(self, url: str, retry_after: str | None) -> float:
+        host = self._host_of(url)
+        seconds = self._parse_retry_after(retry_after)
+        if seconds is None:
+            seconds = self.STREAM_CACHE_FAIL_BACKOFF_SECONDS
+        self._host_backoff[host] = time.monotonic() + seconds
+        logger.warning("DLStreams: %s rate-limited, backing off %.0fs", host, seconds)
+        return seconds
 
-    def _prioritize_player_urls(self, channel_id: str) -> list[str]:
-        players = self._build_player_urls(channel_id)
-        cached_player = self._last_working_player.get(channel_id)
-        if not cached_player:
-            return players
-        if cached_player not in players:
-            self._last_working_player.pop(channel_id, None)
-            return players
-        return [cached_player, *[p for p in players if p != cached_player]]
+    def _rate_limit_wait(self) -> float:
+        """Longest remaining host backoff, dropping expired entries."""
+        now = time.monotonic()
+        self._host_backoff = {
+            host: deadline
+            for host, deadline in self._host_backoff.items()
+            if deadline > now
+        }
+        if not self._host_backoff:
+            return 0.0
+        return max(self._host_backoff.values()) - now
 
-    def _clear_channel_cache(self, channel_id: str) -> None:
-        self._last_working_player.pop(channel_id, None)
-        keys_to_remove = [k for k in self._browser_key_cache if "/key/" in k]
-        for key in keys_to_remove:
-            self._browser_key_cache.pop(key, None)
+    def _prioritize_player_urls(self, channel_id: str, requested_url: str = "") -> list[str]:
+        return self._build_player_urls(channel_id, requested_url=requested_url)
 
     @staticmethod
     def _origin_of(url: str) -> str:
         parsed = urlparse(url)
         return f"{parsed.scheme}://{parsed.netloc}"
 
-    async def _get_browser(self):
-        if self._browser:
-            return self._browser
-        async with self._browser_launch_lock:
-            if self._browser:
-                return self._browser
-            self._playwright = await async_playwright().start()
-            self._browser = await self._playwright.chromium.launch(
-                headless=False,
-                args=[
-                    "--disable-blink-features=AutomationControlled",
-                    "--no-sandbox",
-                    "--autoplay-policy=no-user-gesture-required",
-                ],
+    def _route_diagnostic(self, url: str) -> str:
+        """Describe routing state without exposing proxy credentials."""
+        try:
+            ordered = get_ordered_proxies_for_url(
+                url,
+                "dlstreams",
+                self.proxies,
+                self.bypass_warp_active,
             )
-        return self._browser
+            warp_url = getattr(_cfg, "WARP_PROXY_URL", "")
+            route_types = ["WARP" if proxy == warp_url else "proxy" for proxy in ordered]
+            route_summary = ",".join(route_types) or "none"
+        except Exception as exc:
+            route_summary = f"unavailable({type(exc).__name__})"
 
-    def _get_header(self, name: str, default: str | None = None) -> str | None:
-        for key, value in self.request_headers.items():
-            if key.lower() == name.lower():
-                return value
-        return default
+        warp_enabled = bool(_cfg._get_dynamic_warp_enabled())
+        warp_excluded = bool(_cfg._is_warp_excluded(url or ""))
+        direct_allowed = _cfg.is_direct_connection_allowed(self.bypass_warp_active)
+        host = urlparse(url or "").netloc or "unknown"
+        return (
+            f"target={host} warp={'on' if warp_enabled else 'off'} "
+            f"warp_excluded={'yes' if warp_excluded else 'no'} "
+            f"candidates={route_summary} direct={'allowed' if direct_allowed else 'disabled'}"
+        )
+
+    def _sync_entry_origin_from_url(self, url: str) -> None:
+        parsed = urlparse(url)
+        if parsed.scheme in {"http", "https"} and parsed.netloc:
+            origin = f"{parsed.scheme}://{parsed.netloc}"
+            if origin != self.entry_origin:
+                logger.debug("DLStreams entry origin changed from %s to %s", self.entry_origin, origin)
+                self.entry_origin = origin
+            if not self.stream_origin:
+                self.stream_origin = origin
 
     def _get_cookie_header_for_url(self, url: str) -> str | None:
         if not self.session or self.session.closed or not self.session.cookie_jar:
@@ -124,444 +212,617 @@ class DLStreamsExtractor:
 
     @staticmethod
     def _extract_channel_id(url: str) -> str:
-        match_id = re.search(r"id=(\d+)", url)
+        match_id = re.search(r"(?:id=|premium|stream-)(\d+)", url)
         channel_id = match_id.group(1) if match_id else str(url)
         if not channel_id.isdigit():
             channel_id = channel_id.replace("premium", "")
         return channel_id
 
-    def _build_player_urls(self, channel_id: str) -> list[str]:
+    def _build_player_urls(self, channel_id: str, requested_url: str = "") -> list[str]:
         origin = self.entry_origin.rstrip("/")
+        req_lower = (requested_url or "").lower()
+        if "/stream/stream-" in req_lower:
+            # User explicitly requested Player 1 (/stream/)
+            return [
+                f"{origin}/stream/stream-{channel_id}.php",
+                f"{origin}/cast/stream-{channel_id}.php",
+                f"{origin}/watch/stream-{channel_id}.php",
+                f"{origin}/plus/stream-{channel_id}.php",
+                f"{origin}/casting/stream-{channel_id}.php",
+                f"{origin}/player/stream-{channel_id}.php",
+                f"{origin}/hub/stream-{channel_id}.php",
+            ]
+        # Default: prioritize Player 2 (/cast/) because it provides clean native MPEG-TS (.ts)
+        # without the heavy (7MB+) PNG-wrapped TikTok CDN overhead and frequent 403s of Player 1.
+        # Exception: 861 always tries Player 1 first, even when its Player 2 looks
+        # online in a browser. That backend serves a technically valid stream (HTTP 200,
+        # valid MPEG-TS container, advancing timestamps, decodable-looking frames) whose
+        # video track is unplayable, so every cheap liveness probe promotes it while
+        # playback shows green/black with working audio. The failure only surfaces at
+        # decode time, which no proxy-side check can afford to replicate -- every
+        # simpler approach was tried and discarded, this pin is the fix.
+        first = "stream" if channel_id == "861" else "cast"
+        second = "cast" if channel_id == "861" else "stream"
         return [
-            f"{origin}/stream/stream-{channel_id}.php",
-            f"{origin}/cast/stream-{channel_id}.php",
+            f"{origin}/{first}/stream-{channel_id}.php",
+            f"{origin}/{second}/stream-{channel_id}.php",
             f"{origin}/watch/stream-{channel_id}.php",
             f"{origin}/plus/stream-{channel_id}.php",
             f"{origin}/casting/stream-{channel_id}.php",
             f"{origin}/player/stream-{channel_id}.php",
+            f"{origin}/hub/stream-{channel_id}.php",
         ]
 
-    async def _prime_dlstreams_session(
-        self,
-        session: ClientSession,
-        player_url: str,
-    ) -> None:
-        warmup_headers = {
-            "User-Agent": self.base_headers["User-Agent"],
-            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            "Accept-Language": self._get_header("Accept-Language", "en-US,en;q=0.9"),
-        }
-        source_referer = self._get_header("Referer")
-        if source_referer:
-            warmup_headers["Referer"] = source_referer
+    @staticmethod
+    def _inherit_query_if_missing(absolute_url: str, base_url: str) -> str:
+        """CDNs here issue a token in the playlist URL and list relative URIs.
 
+        Plain urljoin drops the parent token, so the segment/variant probe
+        becomes a 404 and a working player is reported as dead.
+        """
+        parsed = urlparse(absolute_url)
+        if parsed.query:
+            return absolute_url
+        base_query = urlparse(base_url).query
+        if not base_query:
+            return absolute_url
+        return parsed._replace(query=base_query).geturl()
+
+    @classmethod
+    def _first_media_uri(cls, body: str, base_url: str, want_playlist: bool) -> str | None:
+        """First non-comment URI in a playlist: variant (.m3u8) or segment."""
+        for raw in (body or "").splitlines():
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            low = line.lower().split("?")[0].split("#")[0]
+            if (low.endswith(".m3u8")) == want_playlist:
+                return cls._inherit_query_if_missing(urljoin(base_url, line), base_url)
+        return None
+
+    @staticmethod
+    def _segment_looks_like_image(segment_url: str, content_type: str, head: bytes) -> bool:
+        """True when a segment is (or may be) an image container instead of raw TS."""
+        if head[:1] == b"\x47":
+            return False  # already clean MPEG-TS
+        if head.startswith(b"\x89PNG\r\n\x1a\n") or (head[:4] == b"RIFF" and head[8:12] == b"WEBP"):
+            return True
+        low = (segment_url or "").lower()
+        return (
+            (content_type or "").startswith("image/")
+            or ".image" in low
+            or "tiktokcdn" in low
+            or "~tplv-" in low
+        )
+
+    async def _image_segment_carries_ts(
+        self, session, segment_url: str, headers: dict, budget: float | None = None
+    ) -> bool:
+        """Download an image-wrapped segment and check that a real MPEG-TS can be unwrapped.
+
+        Mirrors the proxy: only segments that unwrap to TS are served, anything else
+        (static banner / placeholder) is dropped with HTTP 204. Returns False only when
+        that is definitively the case; network errors/timeouts/oversize are inconclusive
+        and return True so a slow link does not discard a working player.
+        """
         try:
-            async with session.get(player_url, headers=warmup_headers) as resp:
-                await resp.read()
-            warmup_headers["Referer"] = player_url
-        except Exception as exc:
-            logger.debug("DLStreams warm-up failed for %s: %s", player_url, exc)
+            from services.proxy_core import HLSProxyCoreMixin
+        except Exception as e:
+            logger.debug("DLStreams: cannot import unwrapper, skipping deep check: %s", e)
+            return True
 
-    async def fetch_key_via_browser(self, key_url: str, original_url: str) -> bytes | None:
-        cached = self._browser_key_cache.get(key_url)
-        if cached:
-            return cached
-
-        channel_id = self._extract_channel_id(original_url)
-        await self._capture_browser_session_state(channel_id)
-
-        cached = self._browser_key_cache.get(key_url)
-        if cached:
-            return cached
-
-        channel_key = f"premium{channel_id}"
-        player_url = self._build_player_urls(channel_id)[0]
-        if self._is_browser_cooldown_active(channel_key):
-            logger.info("DLStreams browser key fetch skipped during cooldown for %s", channel_key)
-            return None
-
-        logger.info("DLStreams browser key fetch starting for %s", key_url)
+        max_bytes = 16 * 1024 * 1024
+        total = 12.0 if budget is None else max(2.0, min(12.0, budget))
+        body = bytearray()
         try:
-            browser = await self._get_browser()
-            context = await browser.new_context(
-                user_agent=self.base_headers["User-Agent"],
-                viewport={"width": 1366, "height": 768},
+            async with session.get(
+                segment_url, headers=headers, timeout=ClientTimeout(total=total)
+            ) as resp:
+                if resp.status != 200:
+                    return False
+                async for chunk in resp.content.iter_chunked(65536):
+                    body.extend(chunk)
+                    if len(body) > max_bytes:
+                        logger.debug("DLStreams: image segment above %d bytes, deep check inconclusive", max_bytes)
+                        return True
+        except Exception as e:
+            logger.debug("DLStreams: deep segment check inconclusive for %s: %s", segment_url, e)
+            return True
+
+        data = bytes(body)
+        if not data:
+            return False
+        try:
+            unwrapped = await asyncio.to_thread(
+                HLSProxyCoreMixin._strip_fake_png_header_from_ts, data
             )
-            try:
-                await context.route(
-                    "**/*",
-                    lambda route, request: (
-                        route.abort()
-                        if request.resource_type in {"image", "font", "media"}
-                        else route.continue_()
-                    ),
-                )
-            except Exception:
-                pass
-            try:
-                page = await context.new_page()
-                key_bytes: bytes | None = None
+        except Exception as e:
+            logger.debug("DLStreams: unwrap failed for %s: %s", segment_url, e)
+            return False
+        return bool(unwrapped) and len(unwrapped) > 188 and unwrapped[0] == 0x47
 
-                async def on_response(response):
-                    nonlocal key_bytes
-                    try:
-                        if response.url == key_url and response.status == 200 and key_bytes is None:
-                            key_bytes = await response.body()
-                    except Exception as exc:
-                        logger.debug("DLStreams browser response hook failed for %s: %s", response.url, exc)
+    async def _is_stream_alive(self, session, stream_url: str, headers: dict, budget: float | None = None, deep: bool = True) -> bool:
+        """Validate the full chain: master -> variant -> first segment (+ AES key).
 
-                page.on("response", on_response)
-                await page.goto(player_url, wait_until="domcontentloaded", timeout=30000)
+        Some CDNs serve the manifest (200) while segments 403 (IP-bound
+        tokens, datacenter blocks). A manifest-only check would accept a
+        dead player and hide the working ones, so follow the chain with
+        cheap probes (first bytes of the first segment only).
 
-                deadline = time.time() + 25
-                while time.time() < deadline and key_bytes is None:
-                    await page.wait_for_timeout(250)
+        With ``deep=True`` an image-wrapped segment (PNG/WebP, e.g. Player 1) is
+        downloaded once and unwrapped exactly like the proxy does when serving it:
+        if no MPEG-TS can be recovered (static banner/placeholder image, which the
+        proxy would answer with HTTP 204) the player is reported dead so the caller
+        moves on to the next player. ``deep=False`` keeps the cheap check only
+        (used for the quick stale-cache probe).
+        """
+        def _timeout(default: float) -> float:
+            if budget is None:
+                return default
+            return max(1.0, min(default, budget))
 
-                if key_bytes:
-                    self._browser_key_cache[key_url] = key_bytes
-                    self._clear_browser_failure(channel_key)
-                    logger.info("DLStreams browser key fetch succeeded for %s", key_url)
-                    return key_bytes
-                self._clear_channel_cache(channel_id)
-            finally:
-                await context.close()
-        except PlaywrightTimeoutError as exc:
-            logger.warning("DLStreams browser key fetch timed out for %s: %s", key_url, exc)
-        except Exception as exc:
-            logger.warning("DLStreams browser key fetch failed for %s: %s", key_url, exc)
-
-        self._mark_browser_failure(channel_key)
-        return None
-
-    async def _fetch_manifest_directly(self, url: str, headers: dict) -> str | None:
-        """Attempts to fetch the manifest directly using captured session cookies."""
-        session = await self._get_session()
         try:
-            async with session.get(url, headers=headers, timeout=10) as resp:
-                if resp.status == 200:
-                    text = await resp.text()
-                    if text.lstrip().startswith("#EXTM3U"):
-                        logger.debug("DLStreams manifest fetched directly.")
-                        return text
-                logger.debug("DLStreams direct manifest fetch failed with status %s", resp.status)
-        except Exception as exc:
-            logger.debug("DLStreams direct manifest fetch error: %s", exc)
-        return None
-
-    async def _lookup_server_key(self, lookup_base: str, channel_key: str, referer_origin: str) -> str:
-        """Best-effort server key lookup used to build manifest URL candidates."""
-        session = await self._get_session()
-        lookup_url = f"{lookup_base.rstrip('/')}/server_lookup?channel_id={channel_key}"
-        headers = {
-            "Referer": f"{referer_origin.rstrip('/')}/",
-            "User-Agent": self.base_headers["User-Agent"],
-        }
-        try:
-            async with session.get(lookup_url, headers=headers) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    key = data.get("server_key", "wind")
-                    if isinstance(key, str) and key:
-                        return key
-        except Exception as exc:
-            logger.debug("DLStreams server lookup failed for %s: %s", channel_key, exc)
-        return "wind"
-
-    async def _capture_browser_session_state(self, channel_id: str, player_url: str | None = None) -> str | None:
-        channel_key = f"premium{channel_id}"
-        if self._is_browser_cooldown_active(channel_key):
-            logger.info("DLStreams browser session capture skipped during cooldown for %s", channel_key)
-            return None
-
-        lock = self._get_browser_lock(channel_key)
-        async with lock:
-            if self._is_browser_cooldown_active(channel_key):
-                return None
-
-            resolved_player_url = player_url or self._build_player_urls(channel_id)[0]
-            logger.info("DLStreams browser session capture starting for %s", channel_key)
-            try:
-                browser = await self._get_browser()
-                context = await browser.new_context(
-                    user_agent=self.base_headers["User-Agent"],
-                    viewport={"width": 1366, "height": 768},
-                )
+            async with session.get(stream_url, headers=headers, timeout=_timeout(10)) as resp:
+                if resp.status != 200:
+                    logger.debug("DLStreams: validation of %s -> HTTP %s", stream_url, resp.status)
+                    return False
+                master = await resp.text()
+            if "#EXTM3U" not in master[:8000] and "#EXT-X-" not in master[:8000]:
+                logger.debug("DLStreams: validation of %s -> not a playlist", stream_url)
+                return False
+            current_url, current_body = stream_url, master
+            # Master -> variant (media playlists contain #EXTINF, masters don't)
+            if "#EXTINF" not in master:
+                variant = self._first_media_uri(master, stream_url, want_playlist=True)
+                if not variant:
+                    logger.debug("DLStreams: validation of %s -> no variant found", stream_url)
+                    return False
+                async with session.get(variant, headers=headers, timeout=_timeout(8)) as resp:
+                    if resp.status != 200:
+                        logger.debug("DLStreams: validation variant %s -> HTTP %s", variant, resp.status)
+                        return False
+                    current_body = await resp.text()
+                current_url = variant
+                if "#EXTM3U" not in current_body[:8000]:
+                    return False
+            # Variant -> first segment (probe first bytes only)
+            segment = self._first_media_uri(current_body, current_url, want_playlist=False)
+            if not segment:
+                logger.debug("DLStreams: validation of %s -> no segments listed", stream_url)
+                return False
+            probe_headers = {**headers, "Range": "bytes=0-1023"}
+            seg_ctype = ""
+            seg_head = b""
+            async with session.get(segment, headers=probe_headers, timeout=_timeout(8)) as resp:
+                if resp.status not in (200, 206):
+                    logger.debug("DLStreams: segment probe of %s -> HTTP %s", segment, resp.status)
+                    return False
+                seg_ctype = (resp.headers.get("Content-Type") or "").lower()
                 try:
-                    await context.route(
-                        "**/*",
-                        lambda route, request: (
-                            route.abort()
-                            if request.resource_type in {"image", "font", "media"}
-                            else route.continue_()
-                        ),
-                    )
+                    seg_head = await resp.content.read(4096)
                 except Exception:
                     pass
+            if deep and self._segment_looks_like_image(segment, seg_ctype, seg_head):
+                if not await self._image_segment_carries_ts(
+                    session, segment, headers, budget=budget
+                ):
+                    logger.info(
+                        "DLStreams: segment %s is an image with no MPEG-TS payload, treating player as dead",
+                        segment,
+                    )
+                    return False
+            # AES key, if the variant uses one
+            key_match = re.search(r'#EXT-X-KEY:[^\n]*URI="([^"]+)"', current_body)
+            if key_match:
+                key_url = self._inherit_query_if_missing(
+                    urljoin(current_url, key_match.group(1)), current_url
+                )
                 try:
-                    page = await context.new_page()
-                    manifest_text: str | None = None
+                    async with session.get(key_url, headers=headers, timeout=_timeout(8)) as resp:
+                        if resp.status != 200:
+                            logger.debug("DLStreams: key probe of %s -> HTTP %s", key_url, resp.status)
+                            return False
+                except Exception as e:
+                    logger.debug("DLStreams: key probe of %s failed: %s", key_url, e)
+                    return False
+            self._last_validated_manifest = current_body or master
+            return True
+        except Exception as e:
+            logger.debug("DLStreams: validation of %s failed: %s", stream_url, e)
+            return False
 
-                    async def on_response(response):
-                        nonlocal manifest_text
+    def _build_result(self, stream_url: str, playback_headers: dict) -> Dict[str, Any]:
+        """Build the extractor response payload for an accepted stream URL."""
+        parsed_stream = urlparse(stream_url)
+        # Sync session cookies for playback/proxying
+        self.stream_origin = f"{parsed_stream.scheme}://{parsed_stream.netloc}"
+        # Store cookies in session if needed
+        cookie_header = self._get_cookie_header_for_url(stream_url)
+        if cookie_header:
+            playback_headers = {**playback_headers, "Cookie": cookie_header}
+        manifest_text = getattr(self, "_last_validated_manifest", None) or ""
+        return {
+            "destination_url": stream_url,
+            "request_headers": playback_headers,
+            "mediaflow_endpoint": self.mediaflow_endpoint,
+            "captured_manifest": None,
+            "captured_manifests": {stream_url: manifest_text},
+            "selected_proxy": self.last_used_proxy,
+            "force_direct": self._force_direct,
+            "bypass_warp": self.bypass_warp_active,
+        }
+
+    async def _extract_directly(self, url: str, channel_id: str) -> Dict[str, Any] | None:
+        """Fast path direct HTTP M3U8 extraction."""
+        session = await self._get_session(url)
+        player_urls = self._prioritize_player_urls(channel_id, requested_url=url)
+        first_fallback = None  # (stream_url, playback_headers): first URL found, even if dead
+        seen_iframes: set[str] = set()
+        
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + self.EXTRACT_BUDGET_SECONDS
+
+        def _remaining() -> float:
+            return deadline - loop.time()
+
+        def _timeout(default: float) -> float:
+            return max(1.0, min(default, _remaining()))
+
+        for candidate_index, candidate in enumerate(player_urls):
+            if _remaining() <= 2.0:
+                logger.warning(
+                    "DLStreams: extraction budget of %.0fs exhausted after %d/%d players",
+                    self.EXTRACT_BUDGET_SECONDS,
+                    candidate_index,
+                    len(player_urls),
+                )
+                break
+            limited_for = self._host_limited_for(candidate)
+            if limited_for > 0:
+                logger.debug(
+                    "DLStreams: %s rate-limited for another %.0fs, skipping",
+                    self._host_of(candidate),
+                    limited_for,
+                )
+                continue
+            try:
+                headers = {
+                    "User-Agent": self.base_headers["User-Agent"],
+                    "Referer": url,
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8"
+                }
+                
+                logger.debug("DLStreams: GET stream page %s", candidate)
+                async with session.get(candidate, headers=headers, timeout=_timeout(self.CANDIDATE_TIMEOUT_SECONDS)) as resp:
+                    if resp.status != 200:
+                        logger.debug("DLStreams: candidate %s returned status %s", candidate, resp.status)
+                        if resp.status == 429:
+                            self._mark_host_limited(candidate, resp.headers.get("Retry-After"))
+                        continue
+                    html = await resp.text()
+                
+                # Extract player iframe src (support absolute, protocol-relative and relative URLs)
+                iframe_src = None
+                if BeautifulSoup:
+                    try:
+                        soup = BeautifulSoup(html, "html.parser")
+                        iframe_el = soup.find("iframe", id="thatframe") or soup.find("iframe")
+                        if iframe_el:
+                            iframe_src = iframe_el.get("src")
+                    except Exception as e:
+                        logger.debug("DLStreams: bs4 parsing error: %s", e)
+                
+                if not iframe_src:
+                    match = re.search(r'<iframe\s+[^>]*src=["\']([^"\']+)["\']', html, re.I)
+                    if match:
+                        iframe_src = match.group(1).strip()
+                
+                if not iframe_src:
+                    logger.debug("DLStreams: player iframe not found in HTML of %s", candidate)
+                    continue
+
+                # Resolve relative / protocol-relative iframe URLs against the candidate page
+                if iframe_src.startswith("//"):
+                    iframe_src = urlparse(candidate).scheme + ":" + iframe_src
+                elif iframe_src.startswith("/"):
+                    iframe_src = urljoin(candidate, iframe_src)
+                elif not re.match(r"^https?://", iframe_src, re.I):
+                    iframe_src = urljoin(candidate + "/", iframe_src)
+                
+                logger.debug("DLStreams: found player iframe: %s", iframe_src)
+                if iframe_src in seen_iframes:
+                    logger.debug("DLStreams: iframe %s already attempted, skipping", iframe_src)
+                    continue
+                seen_iframes.add(iframe_src)
+                limited_for = self._host_limited_for(iframe_src)
+                if limited_for > 0:
+                    logger.debug(
+                        "DLStreams: %s rate-limited for another %.0fs, skipping iframe",
+                        self._host_of(iframe_src),
+                        limited_for,
+                    )
+                    continue
+                
+                # Fetch iframe player page
+                iframe_headers = headers.copy()
+                iframe_headers["Referer"] = candidate
+                iframe_headers["Origin"] = self.entry_origin
+                
+                async with session.get(iframe_src, headers=iframe_headers, timeout=_timeout(self.CANDIDATE_TIMEOUT_SECONDS)) as resp:
+                    if resp.status != 200:
+                        logger.debug("DLStreams: iframe %s returned status %s", iframe_src, resp.status)
+                        if resp.status == 429:
+                            self._mark_host_limited(iframe_src, resp.headers.get("Retry-After"))
+                        continue
+                    iframe_html = await resp.text()
+                
+                # Extract stream URL from iframe HTML.
+                # Supported formats:
+                #  1) barecrop.net Player 2: window._econfig='...' (Clappr, scrambled base64)
+                #  2) classic: source:window.atob('...') / atob('...')
+                #  3) direct: source: 'https://...m3u8'
+                #  4) fallback: any https://...m3u8 URL in page
+                stream_url = None
+
+                m_cfg = re.search(r"window\._econfig\s*=\s*['\"]([^'\"]{100,})['\"]", iframe_html)
+                if m_cfg:
+                    stream_url = _decode_barecrop_econfig(m_cfg.group(1))
+                    if stream_url:
+                        logger.debug("DLStreams: decoded _econfig stream URL: %s", stream_url)
+
+                if not stream_url:
+                    atob_match = re.search(r"(?:window\.)?atob\(['\"]([A-Za-z0-9+/=]{20,})['\"]\)", iframe_html)
+                    if atob_match:
                         try:
-                            if (
-                                response.url.endswith(f"/proxy/wind/{channel_key}/mono.css")
-                                or f"/proxy/top1/cdn/{channel_key}/mono.css" in response.url
-                                or f"/proxy/" in response.url and f"/{channel_key}/mono.css" in response.url
-                            ) and response.status == 200:
-                                body = await response.body()
-                                decoded = body.decode("utf-8", errors="ignore")
-                                if decoded.lstrip().startswith("#EXTM3U"):
-                                    manifest_text = decoded
-                                    self.stream_origin = self._origin_of(response.url)
-                            if "/key/" in response.url and response.status == 200:
-                                body = await response.body()
-                                self._browser_key_cache[response.url] = body
-                                self.stream_origin = self._origin_of(response.url)
-                        except Exception as exc:
-                            logger.debug("DLStreams browser capture hook failed for %s: %s", response.url, exc)
+                            cand = base64.b64decode(atob_match.group(1)).decode('utf-8', errors='ignore').strip()
+                            if cand.startswith("http"):
+                                stream_url = cand
+                                logger.debug("DLStreams: decrypted stream URL: %s", stream_url)
+                            else:
+                                logger.debug("DLStreams: atob payload is not a URL: %s", cand[:80])
+                        except Exception as e:
+                            logger.debug("DLStreams: atob decode failed: %s", e)
 
-                    context.on("response", on_response)
-                    await page.goto(resolved_player_url, wait_until="domcontentloaded", timeout=30000)
+                if not stream_url:
+                    direct_match = re.search(r"source\s*:\s*['\"](https?://[^'\"]+?)['\"]", iframe_html)
+                    if direct_match:
+                        stream_url = direct_match.group(1).strip()
+                        logger.debug("DLStreams: extracted direct stream URL: %s", stream_url)
 
-                    deadline = time.time() + 25
-                    while time.time() < deadline:
-                        has_key = any("/key/" in key for key in self._browser_key_cache)
-                        if manifest_text and has_key:
-                            break
-                        await page.wait_for_timeout(250)
+                if not stream_url:
+                    m3u8_match = re.search(r"https?://[^\s'\"<>\\]+\.m3u8[^\s'\"<>\\]*", iframe_html)
+                    if m3u8_match:
+                        stream_url = m3u8_match.group(0)
+                        logger.debug("DLStreams: extracted m3u8 fallback URL: %s", stream_url)
 
-                    if manifest_text:
-                        self._last_working_player[channel_id] = resolved_player_url
-                        self._clear_browser_failure(channel_key)
-                    else:
-                        self._clear_channel_cache(channel_id)
-                        self._mark_browser_failure(channel_key)
+                if not stream_url:
+                    logger.debug("DLStreams: no stream URL found. Iframe HTML start: %s", iframe_html[:200])
+                    continue
 
-                    self._captured_cookies = await context.cookies()
-                    
-                    # Log cookie expirations and calculate dynamic refresh interval
-                    min_expiry_remaining = 3600.0  # Default 1 hour fallback
-                    found_expiring_cookie = False
+                if not stream_url.startswith("http"):
+                    logger.debug("DLStreams: invalid stream URL: %s", stream_url[:120])
+                    continue
+                
+                # Format response payload
+                parsed_iframe = urlparse(iframe_src)
+                iframe_origin = f"{parsed_iframe.scheme}://{parsed_iframe.netloc}"
+                
+                # Use iframe origin as the Referer/Origin for playback headers to pass CDN security checks
+                ref_origin = iframe_origin
+                
+                playback_headers = {
+                    "Referer": f"{ref_origin}/",
+                    "Origin": ref_origin,
+                    "User-Agent": self.base_headers["User-Agent"],
+                    "Accept": "*/*",
+                    "Sec-Fetch-Dest": "empty",
+                    "Sec-Fetch-Mode": "cors",
+                    "Sec-Fetch-Site": "cross-site",
+                }
+                
+                # Keep the first URL as last-resort fallback (old behaviour),
+                # but only return it if no player validates as alive.
+                if first_fallback is None:
+                    first_fallback = (stream_url, playback_headers)
 
-                    for cookie in self._captured_cookies:
-                        expiry = cookie.get('expires', -1)
-                        if expiry != -1:
-                            remaining = expiry - time.time()
-                            # Only consider cookies that expire in the near-ish future (less than 1 week)
-                            # extremely long-lived ones are likely tracking IDs
-                            if 0 < remaining < 604800: 
-                                if not found_expiring_cookie or remaining < min_expiry_remaining:
-                                    min_expiry_remaining = remaining
-                                    found_expiring_cookie = True
-                            
-                            logger.info(f"🍪 Cookie captured: {cookie['name']} (Domain: {cookie['domain']}) - Expires in: {remaining/3600:.2f} hours")
-                        else:
-                            logger.info(f"🍪 Cookie captured: {cookie['name']} (Domain: {cookie['domain']}) - Session cookie")
+                # Return the first stream that is actually playable from here.
+                # A dead Player 1 URL must not hide a working Player 2.
+                if await self._is_stream_alive(
+                    session, stream_url, playback_headers, budget=_remaining()
+                ):
+                    logger.info("DLStreams: working stream found via %s", candidate)
+                    result = self._build_result(stream_url, playback_headers)
+                    result["_validated"] = True
+                    return result
+                logger.info("DLStreams: stream from %s is dead, trying next player", candidate)
+                continue
+                
+            except Exception as e:
+                logger.debug("DLStreams: direct extraction candidate %s failed: %s", candidate, e)
+                if candidate_index == 0 and isinstance(e, asyncio.TimeoutError):
+                    # Every candidate shares the dlive.sx origin: when the first
+                    # page does not answer, the others will not either.
+                    logger.warning("DLStreams: site page timed out, aborting candidate loop")
+                    break
+                continue
 
-                    # Calculate adaptive interval: 80% of shortest lifespan, capped between 2m and 1h
-                    adaptive_interval = max(120, min(3600, min_expiry_remaining * 0.8))
-                    self._dynamic_refresh_interval[channel_key] = adaptive_interval
-                    logger.info(f"🔄 Dynamic refresh interval for {channel_key} set to {adaptive_interval/60:.2f} minutes")
+        if first_fallback is not None:
+            stream_url, playback_headers = first_fallback
+            logger.warning("DLStreams: no player validated alive, returning first URL as fallback")
+            return self._build_result(stream_url, playback_headers)
+                
+        return None
 
-                    # Sync cookies to session
-                    if self.session:
-                        yarl_url = URL(resolved_player_url)
-                        for cookie in self._captured_cookies:
-                            self.session.cookie_jar.update_cookies({cookie['name']: cookie['value']}, response_url=yarl_url)
 
-                    logger.info("DLStreams browser session capture completed for %s", channel_key)
-                    self._last_session_refresh[channel_key] = time.time()
-                    return manifest_text
-                finally:
-                    await context.close()
-            except Exception as exc:
-                self._mark_browser_failure(channel_key)
-                logger.warning("DLStreams browser session capture failed for %s: %s", channel_key, exc)
-                return None
-
-    async def _get_session(self):
-        if self.session is None or self.session.closed:
-            # DLStreams keys and segments appear to be tied to a consistent
-            # egress/session context. Using rotating/global proxies here can
-            # produce a different AES key than the browser receives.
-            connector = TCPConnector(limit=0, limit_per_host=0)
-            
-            timeout = ClientTimeout(total=30, connect=10)
-            self.session = ClientSession(
-                timeout=timeout,
-                connector=connector,
-                headers=self.base_headers,
-                cookie_jar=aiohttp.CookieJar(unsafe=True),
+    async def _get_session(self, url: str | None = None):
+        # Determine the correct proxy for the current state
+        target_url = url or self.stream_origin or self.entry_origin
+        forced = None if self._force_direct else _cfg.effective_forced_proxy(target_url, self._forced_proxy)
+        if forced:
+            proxy_url = forced
+        else:
+            proxy_url = await get_preferred_proxy_for_url(target_url, "dlstreams", self.proxies, self.bypass_warp_active)
+        if proxy_url is None and not _cfg.is_direct_connection_allowed(self.bypass_warp_active):
+            raise ExtractorError(
+                "DLStreams: no usable proxy route; direct fallback disabled "
+                f"[{self._route_diagnostic(target_url)}]"
             )
+        self.last_used_proxy = proxy_url
+        
+        session = self._route_sessions.get(proxy_url)
+        if session is not None and not session.closed:
+            self.session = session
+            self._session_proxy = proxy_url
+            return session
+
+        # DLStreams keys and segments appear to be tied to a consistent
+        # egress/session context. Using rotating/global proxies here can
+        # produce a different AES key than the browser receives.
+        if proxy_url:
+            connector = get_connector_for_proxy(proxy_url)
+            logger.debug("DLStreams: Using proxy session: %s", proxy_url)
+        else:
+            connector = TCPConnector(limit=0, limit_per_host=0)
+            logger.debug("DLStreams: Using direct session (Real IP)")
+        
+        timeout = ClientTimeout(total=30, connect=10)
+        self.session = ClientSession(
+            timeout=timeout,
+            connector=connector,
+            headers=self.base_headers,
+            cookie_jar=aiohttp.CookieJar(unsafe=True),
+        )
+        self._session_proxy = proxy_url # Store for future comparison
+        self._route_sessions[proxy_url] = self.session
         return self.session
 
     async def extract(self, url: str, **kwargs) -> Dict[str, Any]:
         """Extracts the M3U8 URL and headers bypassing the public watch page."""
+        self._sync_entry_origin_from_url(url)
+        self._apply_routing_kwargs(url, kwargs)
+        channel_id = self._extract_channel_id(url)
+        req_mode = "stream" if "/stream/stream-" in url.lower() else "default"
+        channel_key = (f"premium{channel_id}", req_mode, self._forced_proxy, self._force_direct, self.bypass_warp_active)
+
+        cached = self._stream_cache.get(channel_key)
+        if cached and cached[0] > time.monotonic():
+            logger.debug("DLStreams: reusing cached stream URL for %s", channel_key)
+            return dict(cached[2])
+
         try:
-            # Extract ID from URL or use as is if numeric
-            channel_id = self._extract_channel_id(url)
+            existing_task = self._inflight_extract_tasks.get(channel_key)
+            if existing_task and not existing_task.done():
+                logger.debug("DLStreams: waiting for in-flight extraction of %s", channel_key)
+                result = await existing_task
+            else:
+                task = asyncio.create_task(self._extract_impl(url, channel_id=channel_id, **kwargs))
+                self._inflight_extract_tasks[channel_key] = task
+                try:
+                    result = await task
+                finally:
+                    current_task = self._inflight_extract_tasks.get(channel_key)
+                    if current_task is task:
+                        self._inflight_extract_tasks.pop(channel_key, None)
+        except Exception:
+            if cached and cached[1] > time.monotonic():
+                if await self._is_cached_still_alive(cached[2]):
+                    logger.warning(
+                        "DLStreams: extraction failed for %s, serving last known stream URL",
+                        channel_key,
+                    )
+                    self._backoff_cache_entry(channel_key, cached)
+                    return dict(cached[2])
+                logger.warning(
+                    "DLStreams: cached stream for %s is dead, not serving stale",
+                    channel_key,
+                )
+            raise
 
-            channel_key = f"premium{channel_id}"
-            session = await self._get_session()
-            
-            # Use cached session info if available to find server and origin
-            iframe_origin = self.entry_origin.rstrip("/")
-            lookup_base = self.stream_origin.rstrip("/")
-            
-            # Determine server_key early so we can try multiple direct manifest URLs
-            # before requiring a browser refresh.
-            server_key = await self._lookup_server_key(lookup_base, channel_key, iframe_origin)
+        if result and result.pop("_validated", False):
+            now = time.monotonic()
+            self._stream_cache[channel_key] = (
+                now + self.STREAM_CACHE_SECONDS,
+                now + self.STREAM_CACHE_STALE_SECONDS,
+                dict(result),
+            )
+        elif result and cached and cached[1] > time.monotonic():
+            if await self._is_cached_still_alive(cached[2]):
+                logger.warning(
+                    "DLStreams: no player validated for %s, serving last known stream URL",
+                    channel_key,
+                )
+                self._backoff_cache_entry(channel_key, cached)
+                return dict(cached[2])
+            logger.warning(
+                "DLStreams: cached stream for %s is dead, not serving stale",
+                channel_key,
+            )
+        elif result:
+            result.pop("_validated", None)
+        return result
 
-            # 1. FETCH ACTUAL MANIFEST (Bypassing permanent cache)
-            candidate_urls = [
-                f"{lookup_base}/proxy/{server_key}/{channel_key}/mono.css",
-                f"{lookup_base}/proxy/wind/{channel_key}/mono.css",
-                f"{lookup_base}/proxy/top1/cdn/{channel_key}/mono.css",
-            ]
-            # preserve order and remove duplicates
-            seen = set()
-            candidate_urls = [u for u in candidate_urls if not (u in seen or seen.add(u))]
-            m3u8_url = candidate_urls[0]
-            
-            playback_headers = {
-                "Referer": f"{iframe_origin}/",
-                "Origin": iframe_origin,
-                "User-Agent": self.base_headers["User-Agent"],
-                "Accept": "*/*",
-                "Sec-Fetch-Dest": "empty",
-                "Sec-Fetch-Mode": "cors",
-                "Sec-Fetch-Site": "cross-site",
-            }
-            
-            # Prep cookies for the session if we have them
-            current_cookie_header = self._get_cookie_header_for_url(m3u8_url)
-            if not current_cookie_header and self._captured_cookies:
-                # Prime session jar with captured browser cookies if empty
-                yarl_url = URL(m3u8_url)
-                for c in self._captured_cookies:
-                    session.cookie_jar.update_cookies({c['name']: c['value']}, response_url=yarl_url)
-            
-            # 1. CHECK MICRO-CACHE (3s)
-            cached_item = self._manifest_cache.get(channel_key)
-            if cached_item and (time.time() - cached_item[1] < 3):
-                logger.debug("DLStreams manifest returned from micro-cache for %s", channel_key)
-                return {
-                    "destination_url": m3u8_url,
-                    "request_headers": playback_headers,
-                    "mediaflow_endpoint": self.mediaflow_endpoint,
-                    "captured_manifest": cached_item[0],
-                }
+    def _backoff_cache_entry(self, channel_key, cached: tuple[float, float, dict]) -> None:
+        """Delay the next scrape, honouring any Retry-After from the hosts."""
+        wait = max(self.STREAM_CACHE_FAIL_BACKOFF_SECONDS, self._rate_limit_wait())
+        self._stream_cache[channel_key] = (
+            time.monotonic() + wait,
+            cached[1],
+            cached[2],
+        )
 
-            # 2. PROACTIVE BACKGROUND REFRESH
-            # Use dynamic interval based on cookie expiration (fallback to 15m if not set yet)
-            last_refresh = self._last_session_refresh.get(channel_key, 0)
-            refresh_threshold = self._dynamic_refresh_interval.get(channel_key, 900)
-            
-            if last_refresh > 0 and (time.time() - last_refresh > refresh_threshold):
-                if channel_key not in self._refresh_tasks or self._refresh_tasks[channel_key].done():
-                    logger.info("DLStreams spawning proactive background refresh for %s (threshold: %.1fm)", 
-                                channel_key, refresh_threshold / 60)
-                    # We use a wrapper to ensure the task is cleaned up
-                    async def do_refresh():
-                        try:
-                            await self._capture_browser_session_state(channel_id)
-                        except Exception as e:
-                            logger.error("DLStreams background refresh failed: %s", e)
-                    
-                    self._refresh_tasks[channel_key] = asyncio.create_task(do_refresh())
+    async def _is_cached_still_alive(self, cached_result: dict) -> bool:
+        """Quick probe before serving a stale URL: fail fast instead of hanging playback."""
+        try:
+            stream_url = (cached_result or {}).get("destination_url", "")
+            if not stream_url:
+                return False
+            headers = (cached_result or {}).get("request_headers", {}) or {}
+            session = await self._get_session(stream_url)
+            return await self._is_stream_alive(session, stream_url, headers, budget=4.0, deep=False)
+        except Exception:
+            return False
 
-            # 3. FETCH ACTUAL MANIFEST
-            # Initial direct fetch attempt
-            captured_manifest = None
-            for candidate in candidate_urls:
-                captured_manifest = await self._fetch_manifest_directly(candidate, playback_headers)
-                if captured_manifest:
-                    m3u8_url = candidate
-                    break
-            
-            if not captured_manifest:
-                # If direct fetch fails, we need to re-capture session state via browser (synchronous fallback)
-                logger.info("DLStreams direct fetch failed or session expired. Refreshing via browser...")
-                player_urls = self._prioritize_player_urls(channel_id)
-                for candidate in player_urls:
-                    await self._prime_dlstreams_session(session, candidate)
-                    captured_manifest = await self._capture_browser_session_state(channel_id, candidate)
-                    if captured_manifest:
-                        # Recalculate base after re-capture
-                        lookup_base = self.stream_origin.rstrip("/")
-                        server_key = await self._lookup_server_key(lookup_base, channel_key, iframe_origin)
-                        m3u8_url = f"{lookup_base}/proxy/{server_key}/{channel_key}/mono.css"
-                        break
-            
-            if not captured_manifest:
-                raise ExtractorError("Could not retrieve manifest after browser refresh.")
-            
-            # Update micro-cache
-            self._manifest_cache[channel_key] = (captured_manifest, time.time())
+    async def _extract_impl(self, url: str, channel_id: str, **kwargs) -> Dict[str, Any]:
+        try:
+            session = await self._get_session(url)
 
-            # 2. SERVER LOOKUP: refresh once more after possible browser re-capture
-            server_key = await self._lookup_server_key(lookup_base, channel_key, iframe_origin)
-            logger.info(f"Found server_key: {server_key} via {iframe_origin}")
+            # Direct browser-less HTTP extraction (only active path)
+            try:
+                logger.info("DLStreams: Attempting direct browser-less HTTP extraction for %s", f"premium{channel_id}")
+                direct_result = await self._extract_directly(url, channel_id)
+                if direct_result:
+                    logger.info("DLStreams: Direct browser-less extraction succeeded for %s!", f"premium{channel_id}")
+                    return direct_result
+            except Exception as direct_exc:
+                logger.debug(
+                    "DLStreams: browser-less extraction failed for %s: %s",
+                    f"premium{channel_id}",
+                    direct_exc,
+                    exc_info=True,
+                )
 
-            # 2. Construct M3U8 URL
-            m3u8_url = f"{lookup_base}/proxy/{server_key}/{channel_key}/mono.css"
+            raise ExtractorError("Could not retrieve manifest via browser-less extraction (browser fallback is disabled).")
 
-            # 3. Setup headers for playback/proxying
-            playback_headers = {
-                "Referer": f"{iframe_origin}/",
-                "Origin": iframe_origin,
-                "User-Agent": self.base_headers["User-Agent"],
-                "Accept": "*/*",
-                "X-Direct-Connection": "1",
-                "Sec-Fetch-Dest": "empty",
-                "Sec-Fetch-Mode": "cors",
-                "Sec-Fetch-Site": "cross-site",
-            }
-            
-            # Combine cookies from session and captured playwright cookies
-            cookie_header = self._get_cookie_header_for_url(m3u8_url)
-            
-            # Also add cookies captured directly from the browser context
-            if self._captured_cookies:
-                relevant_cookies = []
-                stream_domain = urlparse(m3u8_url).netloc
-                entry_domain = urlparse(self.entry_origin).netloc
-                
-                for c in self._captured_cookies:
-                    if stream_domain in c['domain'] or entry_domain in c['domain'] or c['domain'] in stream_domain:
-                        relevant_cookies.append(f"{c['name']}={c['value']}")
-                
-                if relevant_cookies:
-                    browser_cookie_str = "; ".join(relevant_cookies)
-                    if cookie_header:
-                        cookie_header = f"{cookie_header}; {browser_cookie_str}"
-                    else:
-                        cookie_header = browser_cookie_str
-
-            if cookie_header:
-                playback_headers["Cookie"] = cookie_header
-
-            logger.info(f"Extracted M3U8: {m3u8_url}")
-
-            return {
-                "destination_url": m3u8_url,
-                "request_headers": playback_headers,
-                "mediaflow_endpoint": self.mediaflow_endpoint,
-                "captured_manifest": captured_manifest,
-            }
-
+        except asyncio.CancelledError:
+            raise
+        except ExtractorError:
+            raise
         except Exception as e:
-            logger.exception(f"DLStreams extraction failed for {url}")
-            raise ExtractorError(f"Extraction failed: {str(e)}")
+            logger.debug("DLStreams internal extraction error for %s: %s", url, e, exc_info=True)
+            raise ExtractorError(f"DLStreams extraction failed: {str(e)}") from None
 
     async def close(self):
-        if self.session and not self.session.closed:
-            await self.session.close()
-            self.session = None
-        if self._browser:
-            await self._browser.close()
-            self._browser = None
-        if self._playwright:
-            await self._playwright.stop()
-            self._playwright = None
+        pending_tasks = list(self._inflight_extract_tasks.values())
+        for task in pending_tasks:
+            task.cancel()
+        if pending_tasks:
+            await asyncio.gather(*pending_tasks, return_exceptions=True)
+        self._inflight_extract_tasks.clear()
+        sessions = set(self._route_sessions.values())
+        if self.session is not None:
+            sessions.add(self.session)
+        for session in sessions:
+            if not session.closed:
+                await session.close()
+        self._route_sessions.clear()
+        self.session = None

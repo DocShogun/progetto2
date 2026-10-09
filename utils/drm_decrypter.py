@@ -7,6 +7,13 @@ from Crypto.Cipher import AES
 from collections import namedtuple
 import array
 
+try:
+    # OpenSSL-backed CTR is materially faster for the multi-sample fMP4
+    # segments used by the MPD->HLS compatibility path.
+    from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
+except ImportError:  # pragma: no cover - exercised only in minimal installs
+    Cipher = algorithms = modes = None
+
 CENCSampleAuxiliaryDataFormat = namedtuple("CENCSampleAuxiliaryDataFormat", ["is_encrypted", "iv", "sub_samples"])
 
 
@@ -188,13 +195,21 @@ class MP4Decrypter:
         self.trun_sample_sizes = array.array("I")
         self.current_sample_info = []
         self.encryption_overhead = 0
+        # Bytes removed from the current moof before mdat.  The trun data
+        # offset and any following sidx reference must account for them.
+        self._moof_removed_overhead = 0
+        self.track_kid_map = {}  # track_id -> KID (bytes) from tenc box
+        self._last_extracted_kid = None  # temp storage during moov processing
+        self._default_sample_size = 0  # from tfhd, used when trun lacks sample-size-present
 
-    def decrypt_segment(self, combined_segment: bytes) -> bytes:
+    def decrypt_segment(self, combined_segment: bytes, init_length: int = 0) -> bytes:
         """
         Decrypts a combined MP4 segment.
 
         Args:
             combined_segment (bytes): Combined initialization and media segment.
+            init_length (int): Length of the initialization segment. If > 0, all atoms
+                               belonging to the initialization segment are skipped in the output.
 
         Returns:
             bytes: Decrypted segment content.
@@ -211,7 +226,12 @@ class MP4Decrypter:
                 processed_atoms[atom_type] = self._process_atom(atom_type, atom)
 
         result = bytearray()
+        current_offset = 0
         for atom in atoms:
+            is_init_atom = current_offset < init_length
+            current_offset += atom.size
+            if init_length > 0 and is_init_atom:
+                continue
             if atom.atom_type in processed_atoms:
                 processed_atom = processed_atoms[atom.atom_type]
                 result.extend(processed_atom.pack())
@@ -279,8 +299,17 @@ class MP4Decrypter:
         """
         parser = MP4Parser(moof.data)
         new_moof_data = bytearray()
+        # Some CMAF/DASH origins repeat Widevine/PlayReady PSSH boxes in
+        # every media moof, not only in the initialization segment.  Once
+        # ClearKey decryption has completed, those boxes must not reach the
+        # HLS/fMP4 player or it may open an unsupported DRM session again.
+        self._moof_removed_overhead = sum(
+            atom.size for atom in parser.list_atoms() if atom.atom_type == b"pssh"
+        )
 
         for atom in iter(parser.read_atom, None):
+            if atom.atom_type == b"pssh":
+                continue
             if atom.atom_type == b"traf":
                 new_traf = self._process_traf(atom)
                 new_moof_data.extend(new_traf.pack())
@@ -289,17 +318,24 @@ class MP4Decrypter:
 
         return MP4Atom(b"moof", len(new_moof_data) + 8, new_moof_data)
 
+    @staticmethod
+    def _parse_tfhd_default_sample_size(tfhd: MP4Atom) -> int:
+        if len(tfhd.data) < 8:
+            return 0
+        flags = struct.unpack_from(">I", tfhd.data, 0)[0] & 0xFFFFFF
+        offset = 8
+        if flags & 0x000001:
+            offset += 8
+        if flags & 0x000002:
+            offset += 4
+        if flags & 0x000008:
+            offset += 4
+        if flags & 0x000010:
+            if offset + 4 <= len(tfhd.data):
+                return struct.unpack_from(">I", tfhd.data, offset)[0]
+        return 0
+
     def _process_traf(self, traf: MP4Atom) -> MP4Atom:
-        """
-        Processes the 'traf' (Track Fragment) atom, which contains information about a track fragment.
-        This includes sample information, sample encryption data, and other track-level metadata.
-
-        Args:
-            traf (MP4Atom): The 'traf' atom to process.
-
-        Returns:
-            MP4Atom: Processed 'traf' atom with updated sample information.
-        """
         parser = MP4Parser(traf.data)
         new_traf_data = bytearray()
         tfhd = None
@@ -308,21 +344,22 @@ class MP4Decrypter:
 
         atoms = parser.list_atoms()
 
-        # calculate encryption_overhead earlier to avoid dependency on trun
-        self.encryption_overhead = sum(a.size for a in atoms if a.atom_type in {b"senc", b"saiz", b"saio"})
+        self.encryption_overhead = self._moof_removed_overhead + sum(
+            a.size for a in atoms if a.atom_type in {b"senc", b"saiz", b"saio", b"sbgp", b"sgpd"}
+        )
 
         for atom in atoms:
             if atom.atom_type == b"tfhd":
                 tfhd = atom
+                self._default_sample_size = self._parse_tfhd_default_sample_size(tfhd)
                 new_traf_data.extend(atom.pack())
             elif atom.atom_type == b"trun":
                 sample_count = self._process_trun(atom)
                 new_trun = self._modify_trun(atom)
                 new_traf_data.extend(new_trun.pack())
             elif atom.atom_type == b"senc":
-                # Parse senc but don't include it in the new decrypted traf data and similarly don't include saiz and saio
                 sample_info = self._parse_senc(atom, sample_count)
-            elif atom.atom_type not in {b"saiz", b"saio"}:
+            elif atom.atom_type not in {b"saiz", b"saio", b"sbgp", b"sgpd"}:
                 new_traf_data.extend(atom.pack())
 
         if tfhd:
@@ -412,14 +449,9 @@ class MP4Decrypter:
         """
         Retrieves the decryption key for a given track ID from the key map.
         
-        For multi-key scenarios (e.g., separate video/audio keys), the key_map
-        contains KID->KEY mappings. Since we don't have the KID for the current
-        track at this point, we use a simple strategy:
-        - If there's only 1 key, use it (original behavior)
-        - If there are multiple keys, return based on track_id index (0=first key, 1=second, etc.)
-        
-        This works because typically track 1 = video, track 2 = audio, and
-        the keys are passed in order: video_kid,audio_kid : video_key,audio_key
+        Uses the real KID extracted from the tenc box (stored in track_kid_map
+        during moov processing) to look up the correct key from key_map.
+        This supports any number of KID:KEY pairs correctly.
 
         Args:
             track_id (int): The track ID.
@@ -427,11 +459,17 @@ class MP4Decrypter:
         Returns:
             bytes: The decryption key for the specified track ID.
         """
+        # Best: look up the actual KID for this track from the tenc box
+        if track_id in self.track_kid_map:
+            kid = self.track_kid_map[track_id]
+            if kid in self.key_map:
+                return self.key_map[kid]
+        
+        # Single key: use it directly
         if len(self.key_map) == 1:
             return next(iter(self.key_map.values()))
         
-        # Multi-key: return key by index based on track_id
-        # Track IDs are typically 1-based, so we use (track_id - 1) as index
+        # Last resort fallback: index-based (for segments without moov/tenc info)
         keys_list = list(self.key_map.values())
         key_index = (track_id - 1) % len(keys_list)
         return keys_list[key_index]
@@ -457,23 +495,34 @@ class MP4Decrypter:
 
         # pad IV to 16 bytes
         iv = sample_info.iv + b"\x00" * (16 - len(sample_info.iv))
-        cipher = AES.new(key, AES.MODE_CTR, initial_value=iv, nonce=b"")
+        if Cipher is not None:
+            cipher = Cipher(algorithms.AES(key), modes.CTR(iv)).encryptor()
+            decrypt = cipher.update
+            finalize = cipher.finalize
+        else:
+            cipher = AES.new(key, AES.MODE_CTR, initial_value=iv, nonce=b"")
+            decrypt = cipher.decrypt
+            finalize = lambda: b""
 
         if not sample_info.sub_samples:
             # If there are no sub_samples, decrypt the entire sample
-            return cipher.decrypt(sample)
+            result = decrypt(sample)
+            finalize()
+            return result
 
         result = bytearray()
         offset = 0
         for clear_bytes, encrypted_bytes in sample_info.sub_samples:
             result.extend(sample[offset : offset + clear_bytes])
             offset += clear_bytes
-            result.extend(cipher.decrypt(sample[offset : offset + encrypted_bytes]))
+            result.extend(decrypt(sample[offset : offset + encrypted_bytes]))
             offset += encrypted_bytes
 
         # If there's any remaining data, treat it as encrypted
         if offset < len(sample):
-            result.extend(cipher.decrypt(sample[offset:]))
+            result.extend(decrypt(sample[offset:]))
+
+        finalize()
 
         return result
 
@@ -497,16 +546,17 @@ class MP4Decrypter:
             data_offset += 4
 
         self.trun_sample_sizes = array.array("I")
+        default_size = self._default_sample_size
 
         for _ in range(sample_count):
-            if trun_flags & 0x000100:  # sample-duration-present flag
+            if trun_flags & 0x000100:
                 data_offset += 4
-            if trun_flags & 0x000200:  # sample-size-present flag
+            if trun_flags & 0x000200:
                 sample_size = struct.unpack_from(">I", trun.data, data_offset)[0]
                 self.trun_sample_sizes.append(sample_size)
                 data_offset += 4
             else:
-                self.trun_sample_sizes.append(0)  # Using 0 instead of None for uniformity in the array
+                self.trun_sample_sizes.append(default_size)
             if trun_flags & 0x000400:  # sample-flags-present flag
                 data_offset += 4
             if trun_flags & 0x000800:  # sample-composition-time-offsets-present flag
@@ -571,14 +621,33 @@ class MP4Decrypter:
             MP4Atom: Processed 'trak' atom with updated track information.
         """
         parser = MP4Parser(trak.data)
+        atoms = parser.list_atoms()
         new_trak_data = bytearray()
 
-        for atom in iter(parser.read_atom, None):
+        # Extract track_id from tkhd
+        track_id = None
+        for atom in atoms:
+            if atom.atom_type == b"tkhd":
+                if len(atom.data) > 20:
+                    version = atom.data[0] if isinstance(atom.data[0], int) else ord(atom.data[0])
+                    if version == 1:
+                        track_id = struct.unpack_from(">I", atom.data, 20)[0]
+                    else:
+                        track_id = struct.unpack_from(">I", atom.data, 12)[0]
+                break
+
+        self._last_extracted_kid = None
+
+        for atom in atoms:
             if atom.atom_type == b"mdia":
                 new_mdia = self._process_mdia(atom)
                 new_trak_data.extend(new_mdia.pack())
             else:
                 new_trak_data.extend(atom.pack())
+
+        # Store KID mapping for this track (extracted from tenc inside sinf)
+        if track_id is not None and self._last_extracted_kid is not None:
+            self.track_kid_map[track_id] = self._last_extracted_kid
 
         return MP4Atom(b"trak", len(new_trak_data) + 8, new_trak_data)
 
@@ -646,7 +715,7 @@ class MP4Decrypter:
             if atom.atom_type == b"stsd":
                 new_stsd = self._process_stsd(atom)
                 new_stbl_data.extend(new_stsd.pack())
-            else:
+            elif atom.atom_type not in {b"sbgp", b"sgpd"}:
                 new_stbl_data.extend(atom.pack())
 
         return MP4Atom(b"stbl", len(new_stbl_data) + 8, new_stbl_data)
@@ -705,6 +774,9 @@ class MP4Decrypter:
             if atom.atom_type in {b"sinf", b"schi", b"tenc", b"schm"}:
                 if atom.atom_type == b"sinf":
                     codec_format = self._extract_codec_format(atom)
+                    kid = self._extract_kid_from_sinf(atom)
+                    if kid is not None:
+                        self._last_extracted_kid = kid
                 continue  # Skip encryption-related atoms
             new_entry_data.extend(atom.pack())
 
@@ -729,8 +801,32 @@ class MP4Decrypter:
                 return atom.data
         return None
 
+    def _extract_kid_from_sinf(self, sinf: MP4Atom) -> Optional[bytes]:
+        """
+        Extracts the default KID from the 'tenc' box inside sinf -> schi -> tenc.
+        
+        tenc layout: version(1) + flags(3) + reserved(2) + isProtected(1) + perSampleIVSize(1) + default_KID(16)
+        So KID is at offset 8..24 of tenc data.
 
-def decrypt_segment(init_segment: bytes, segment_content: bytes, key_id: str, key: str) -> bytes:
+        Args:
+            sinf (MP4Atom): The 'sinf' atom.
+
+        Returns:
+            Optional[bytes]: The 16-byte KID or None.
+        """
+        parser = MP4Parser(sinf.data)
+        for atom in iter(parser.read_atom, None):
+            if atom.atom_type == b"schi":
+                schi_parser = MP4Parser(atom.data)
+                for schi_atom in iter(schi_parser.read_atom, None):
+                    if schi_atom.atom_type == b"tenc" and len(schi_atom.data) >= 24:
+                        if schi_atom.data[0] == 1 and len(schi_atom.data) >= 20:
+                            return bytes(schi_atom.data[4:20])
+                        return bytes(schi_atom.data[8:24])
+        return None
+
+
+def decrypt_segment(init_segment: bytes, segment_content: bytes, key_id: str, key: str, skip_init: bool = False) -> bytes:
     """
     Decrypts a CENC encrypted MP4 segment.
 
@@ -739,6 +835,7 @@ def decrypt_segment(init_segment: bytes, segment_content: bytes, key_id: str, ke
         segment_content (bytes): Encrypted segment content.
         key_id (str): Key ID(s) in hexadecimal format. Supports comma-separated for multi-key: "KID1,KID2"
         key (str): Key(s) in hexadecimal format. Supports comma-separated for multi-key: "KEY1,KEY2"
+        skip_init (bool): If True, all atoms belonging to the initialization segment are excluded from the output.
     
     Returns:
         bytes: Decrypted segment content.
@@ -759,7 +856,8 @@ def decrypt_segment(init_segment: bytes, segment_content: bytes, key_id: str, ke
         key_map[bytes.fromhex(kid)] = bytes.fromhex(k)
     
     decrypter = MP4Decrypter(key_map)
-    decrypted_content = decrypter.decrypt_segment(init_segment + segment_content)
+    init_length = len(init_segment) if skip_init else 0
+    decrypted_content = decrypter.decrypt_segment(init_segment + segment_content, init_length=init_length)
     return decrypted_content
 
 

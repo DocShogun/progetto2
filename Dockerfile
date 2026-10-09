@@ -1,62 +1,123 @@
-# Fase 1: Build
-# Usa un'immagine Python con base Debian per FFmpeg completo
-FROM python:3.11-bookworm
+# Monolithic Dockerfile for EasyProxy
+# Optimized EasyProxy runtime
+# Compatible with AMD64 and ARM64 (Oracle VPS)
 
-# Imposta la directory di lavoro all'interno del container.
+FROM python:3.12-slim-bookworm
+
+# 1. Environment Settings
 WORKDIR /app
-
-# Copia il file delle dipendenze.
-# Farlo prima del resto del codice sfrutta la cache di Docker se le dipendenze non cambiano.
-COPY requirements.txt .
-
-# Runtime flags for browser-assisted extractors in containers.
-ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
-ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=0
 ENV PYTHONUNBUFFERED=1
 
-# Installa FFmpeg e le dipendenze necessarie a Chromium/Xvfb.
-RUN apt-get update && apt-get install -y \
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    curl \
+    git \
+    jq \
+    wireguard-tools \
+    tor \
+    tor-geoipdb \
+    tar \
+    nodejs \
+    node-undici \
+    npm \
+    netcat-openbsd \
+    procps \
     ffmpeg \
+    fonts-dejavu \
+    chromium \
+    chromium-common \
+    chromium-driver \
     xvfb \
-    libnss3 \
-    libatk1.0-0 \
-    libatk-bridge2.0-0 \
-    libcups2 \
-    libdrm2 \
-    libxkbcommon0 \
-    libxcomposite1 \
-    libxdamage1 \
-    libxfixes3 \
-    libxrandr2 \
-    libgbm1 \
-    libasound2 \
-    libpango-1.0-0 \
-    libcairo2 \
-    libatspi2.0-0 \
-    libxshmfence1 \
-    libglu1-mesa \
+    xauth \
+    dumb-init \
     ca-certificates \
-    fonts-liberation \
     && rm -rf /var/lib/apt/lists/*
 
-# Installa le dipendenze Python.
+# FlareSolverr is part of this image, but EasyProxy starts it only on-demand
+# when VixSrc returns a Cloudflare challenge.
+ARG FLARESOLVERR_VERSION=3.5.2
+RUN set -eux; \
+    git clone --depth 1 --branch "v${FLARESOLVERR_VERSION}" \
+        https://github.com/FlareSolverr/FlareSolverr.git /opt/flaresolverr; \
+    pip install --no-cache-dir -r /opt/flaresolverr/requirements.txt; \
+    rm -rf /opt/flaresolverr/.git
+
+# WARP config generator and stable userspace SOCKS5 relay.
+# The generator is pinned so image rebuilds remain reproducible. It is used
+# only on first startup when /data/warp.conf does not exist.
+ARG WARP_GENERATOR_COMMIT=d4616f154d654d5c159c193432159240c96614bb
+ARG WIREPROXY_VERSION=1.1.3
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+        amd64) wireproxy_arch="amd64" ;; \
+        arm64) wireproxy_arch="arm64" ;; \
+        armhf) wireproxy_arch="arm" ;; \
+        *) echo "Unsupported architecture for wireproxy: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fL "https://raw.githubusercontent.com/lanrat/wireguard-warp-generator/${WARP_GENERATOR_COMMIT}/scripts/warp-register.sh" -o /usr/local/bin/warp-register; \
+    chmod 700 /usr/local/bin/warp-register; \
+    curl -fL "https://github.com/windtf/wireproxy/releases/download/v${WIREPROXY_VERSION}/wireproxy_linux_${wireproxy_arch}.tar.gz" -o /tmp/wireproxy.tar.gz; \
+    curl -fL "https://github.com/windtf/wireproxy/releases/download/v${WIREPROXY_VERSION}/checksums.txt" -o /tmp/wireproxy.checksums; \
+    checksum="$(awk -v asset="wireproxy_linux_${wireproxy_arch}.tar.gz" '$2 == asset { print $1 }' /tmp/wireproxy.checksums)"; \
+    test -n "$checksum"; \
+    printf '%s  /tmp/wireproxy.tar.gz\n' "$checksum" | sha256sum -c -; \
+    tar -xzf /tmp/wireproxy.tar.gz -C /usr/local/bin wireproxy; \
+    chmod +x /usr/local/bin/wireproxy; \
+    rm -f /tmp/wireproxy.tar.gz /tmp/wireproxy.checksums; \
+    mkdir -p /etc/wireguard
+
+# Install Ookla Speedtest CLI for the admin panel speedtest
+ARG SPEEDTEST_VERSION=1.2.0
+RUN set -eux; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+        amd64) speedtest_arch="x86_64" ;; \
+        arm64) speedtest_arch="aarch64" ;; \
+        *) echo "Unsupported architecture for speedtest: $arch" >&2; exit 1 ;; \
+    esac; \
+    curl -fsSL "https://install.speedtest.net/app/cli/ookla-speedtest-${SPEEDTEST_VERSION}-linux-${speedtest_arch}.tgz" -o /tmp/speedtest.tgz; \
+    tar -xzf /tmp/speedtest.tgz -C /usr/local/bin speedtest; \
+    chmod +x /usr/local/bin/speedtest; \
+    rm -f /tmp/speedtest.tgz
+
+# 2. EasyProxy Dependencies
+WORKDIR /app
+COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
+# 3. Environment Settings
+ENV PYTHONPATH=/app
+ENV FLARESOLVERR_DIR=/opt/flaresolverr
+ENV FLARESOLVERR_LOG_LEVEL=error
 
-# Installa Chromium gestito da Playwright.
-RUN python -m playwright install chromium
-
-# Copia il resto del codice dell'applicazione nella directory di lavoro.
+# Copia esplicita
 COPY . .
 
-# Metadata dell'immagine OCI (Open Container Initiative) corretti.
-LABEL org.opencontainers.image.title="HLS Proxy Server"
-LABEL org.opencontainers.image.description="Server proxy universale per stream HLS con supporto Vavoo, DLHD e playlist builder"
-LABEL org.opencontainers.image.version="2.5.0"
-LABEL org.opencontainers.image.source="https://github.com/realbestia1/EasyProxy"
+# Node dependencies for the VidXgo TLS-fingerprint runner (tls-client ->
+# ffi-napi, which ships prebuilds for linux-x64/arm64; --ignore-scripts keeps
+# the image build toolchain-free).
+RUN npm install --omit=dev --ignore-scripts --no-audit --no-fund
 
-# Esponi la porta su cui l'applicazione è in ascolto.
+# Windows checkouts may carry CRLF into shell scripts; Linux must execute LF.
+RUN sed -i 's/\r$//' entrypoint.sh scripts/warp_userspace_ctl.sh scripts/wg_tunnel_ctl.sh
+
+# Node's ESM resolver does not search Debian's global module directory for a
+# bare import. Expose the apt-installed undici package from the app module
+# tree so the VidFast runner can use HTTP ProxyAgent when WARP is selected.
+RUN mkdir -p /app/node_modules \
+    && ln -s /usr/share/nodejs/undici /app/node_modules/undici
+
+# FlareSolverr uses this Docker marker to avoid downloading an
+# undetected_chromedriver binary for the wrong CPU architecture. Debian's
+# chromedriver comes from the same package set as Chromium above.
+RUN ln -sf "$(command -v chromedriver)" /app/chromedriver
+
+RUN chmod +x entrypoint.sh scripts/warp_userspace_ctl.sh scripts/wg_tunnel_ctl.sh
+
+# 5. Metadata & Ports
+LABEL org.opencontainers.image.title="EasyProxy Monolith"
+LABEL org.opencontainers.image.description="All-in-one HLS Proxy with integrated CF Turnstile Solver"
 EXPOSE 7860
+VOLUME ["/data"]
 
-# Comando per avviare l'app in produzione con Gunicorn
-# Usa sh -c per permettere l'espansione delle variabili e il fallback dinamico dei worker
-CMD ["sh", "-c", "WORKERS_COUNT=${WORKERS:-$(nproc 2>/dev/null || echo 1)}; xvfb-run -a --server-args='-screen 0 1366x768x24' gunicorn --bind 0.0.0.0:${PORT:-7860} --workers $WORKERS_COUNT --worker-class aiohttp.worker.GunicornWebWorker --timeout 120 --graceful-timeout 120 app:app"]
+# 6. Execution
+ENTRYPOINT ["/bin/bash", "/app/entrypoint.sh"]

@@ -1,53 +1,28 @@
-import logging
-import random
 import re
 from urllib.parse import urlparse
-from aiohttp import ClientSession, ClientTimeout, TCPConnector
-from aiohttp_socks import ProxyConnector
+from extractors.base import BaseExtractor, ExtractorError
 
-logger = logging.getLogger(__name__)
-
-class ExtractorError(Exception):
-    pass
-
-class VidozaExtractor:
+class VidozaExtractor(BaseExtractor):
     """Vidoza URL extractor."""
 
     def __init__(self, request_headers: dict, proxies: list = None):
-        self.request_headers = request_headers
-        self.base_headers = {
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
-        self.session = None
+        super().__init__(request_headers, proxies, extractor_name="vidoza")
         self.mediaflow_endpoint = "proxy_stream_endpoint"
-        self.proxies = proxies or []
-
-    def _get_random_proxy(self):
-        return random.choice(self.proxies) if self.proxies else None
-
-    async def _get_session(self):
-        if self.session is None or self.session.closed:
-            timeout = ClientTimeout(total=60, connect=30, sock_read=30)
-            proxy = self._get_random_proxy()
-            if proxy:
-                connector = ProxyConnector.from_url(proxy)
-            else:
-                connector = TCPConnector(limit=0, limit_per_host=0, keepalive_timeout=60, enable_cleanup_closed=True, force_close=False, use_dns_cache=True)
-            self.session = ClientSession(timeout=timeout, connector=connector, headers={'User-Agent': self.base_headers["user-agent"]})
-        return self.session
 
     async def extract(self, url: str, **kwargs) -> dict:
         """Extract Vidoza URL."""
+        self._apply_routing_kwargs(url, kwargs)
         parsed = urlparse(url)
+        host = (parsed.hostname or "").lower()
+
+        # vidoza.in now serves the ShareVideo platform (SPA + JSON API)
+        if host.endswith("vidoza.in"):
+            return await self._extract_sharevideo(url, parsed)
 
         # Accept vidoza + videzz
-        if not parsed.hostname or not (
-            parsed.hostname.endswith("vidoza.net") or parsed.hostname.endswith("videzz.net")
-        ):
+        if not (host.endswith("vidoza.net") or host.endswith("videzz.net")):
             raise ExtractorError("VIDOZA: Invalid domain")
 
-        session = await self._get_session()
-        
         headers = self.base_headers.copy()
         headers.update({
             "referer": "https://vidoza.net/",
@@ -55,10 +30,10 @@ class VidozaExtractor:
             "accept-language": "en-US,en;q=0.9",
         })
 
-        # 1) Fetch the embed page (or whatever URL you pass in)
-        async with session.get(url, headers=headers) as response:
-            html = await response.text()
-            cookies = {k: v.value for k, v in response.cookies.items()}
+        # 1) Fetch the embed page
+        resp = await self._make_request(url, headers=headers)
+        html = resp.text
+        cookies = {k: v.value for k, v in resp.cookies.items()}
 
         if not html:
             raise ExtractorError("VIDOZA: Empty HTML from Vidoza")
@@ -89,8 +64,47 @@ class VidozaExtractor:
             "destination_url": mp4_url,
             "request_headers": headers,
             "mediaflow_endpoint": self.mediaflow_endpoint,
+            "selected_proxy": self.last_used_proxy,
+            "force_direct": self._force_direct,
+            "bypass_warp": self.bypass_warp_active,
+        }
+
+    async def _extract_sharevideo(self, url: str, parsed) -> dict:
+        """Resolve a vidoza.in /video/<id> page to its direct CDN MP4."""
+        video_id = parsed.path.rstrip("/").rsplit("/", 1)[-1]
+        if not re.fullmatch(r"[0-9a-fA-F]{24}", video_id):
+            raise ExtractorError(f"VIDOZA: unsupported vidoza.in URL: {url}")
+
+        headers = self.base_headers.copy()
+        headers.update({
+            "accept": "application/json",
+            "x-client-type": "web",
+            "secret-key": "5TIvw5cpc0",
+            "referer": url,
+        })
+        resp = await self._make_request(
+            "https://vidoza.in/client/video/detailsOfVideo",
+            headers=headers,
+            params={
+                "userId": "000000000000000000000000",
+                "videoId": video_id,
+                "videoType": 1,
+            },
+        )
+
+        video = (resp.json or {}).get("detailsOfVideo") or {}
+        mp4_url = video.get("videoUrl")
+        if not mp4_url:
+            raise ExtractorError("VIDOZA: vidoza.in API returned no video URL")
+
+        return {
+            "destination_url": mp4_url,
+            "request_headers": {},
+            "mediaflow_endpoint": self.mediaflow_endpoint,
+            "selected_proxy": self.last_used_proxy,
+            "force_direct": self._force_direct,
+            "bypass_warp": self.bypass_warp_active,
         }
 
     async def close(self):
-        if self.session and not self.session.closed:
-            await self.session.close()
+        await super().close()

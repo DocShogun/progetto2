@@ -8,10 +8,10 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 from typing import Dict, List, Optional, Any, Tuple
-from urllib.parse import urlencode
+from urllib.parse import urlencode, parse_qsl, urlsplit
 
 import aiohttp
-
+import config_store
 from services.recording_db import RecordingDB
 from config import PORT, API_PASSWORD
 
@@ -38,23 +38,36 @@ class StreamConfig:
 
 
 class RecordingManager:
-    """Manages FFmpeg recording processes for DVR functionality."""
+    """Manages recording processes for DVR functionality."""
 
     # Stream types that benefit from reconnection (proxy handles token refresh)
     RECONNECT_TYPES = {StreamType.VAVOO, StreamType.FREESHOT,
                        StreamType.SPORTSONLINE, StreamType.MPD}
 
-    def __init__(self, recordings_dir: str, max_duration: int = 28800,
-                 retention_days: int = 7):
+    def __init__(self, recordings_dir: str):
         self.recordings_dir = recordings_dir
-        self.max_duration = max_duration
-        self.retention_days = retention_days
+        if not os.path.exists(self.recordings_dir):
+            os.makedirs(self.recordings_dir)
         self.db = RecordingDB(recordings_dir)
         self.processes: Dict[str, asyncio.subprocess.Process] = {}
         self.start_times: Dict[str, float] = {}
+        self._session: Optional[aiohttp.ClientSession] = None
+        self._monitor_tasks: Dict[str, asyncio.Task] = {}
+        self._cleanup_task: Optional[asyncio.Task] = None
 
-        if not os.path.exists(self.recordings_dir):
-            os.makedirs(self.recordings_dir)
+    @property
+    def session(self) -> aiohttp.ClientSession:
+        if self._session is None or self._session.closed:
+            self._session = aiohttp.ClientSession(
+                timeout=aiohttp.ClientTimeout(total=30, connect=10),
+                connector=aiohttp.TCPConnector(limit=10),
+            )
+        return self._session
+
+    async def close(self):
+        if self._session and not self._session.closed:
+            await self._session.close()
+        self._session = None
 
     # =========================================================================
     # Stream Type Detection
@@ -71,7 +84,7 @@ class RecordingManager:
             return StreamType.VAVOO
         elif 'popcdn.day' in url_lower or 'freeshot' in url_lower:
             return StreamType.FREESHOT
-        elif any(d in url_lower for d in ['sportsonline', 'sportzonline']):
+        elif any(d in url_lower for d in ['sportsonline', 'sportzonline', 'sportsonlline', 'sportsonlinne']):
             return StreamType.SPORTSONLINE
 
         return StreamType.GENERIC
@@ -83,7 +96,9 @@ class RecordingManager:
     async def _prepare_stream_config(
         self,
         url: str,
-        clearkey: Optional[str] = None
+        clearkey: Optional[str] = None,
+        extractor: Optional[str] = None,
+        max_res: bool = False
     ) -> StreamConfig:
         """
         Prepare stream configuration based on stream type.
@@ -94,30 +109,32 @@ class RecordingManager:
         stream_type = self._detect_stream_type(url)
 
         if stream_type == StreamType.MPD:
-            return await self._prepare_mpd_config(url, clearkey)
+            return await self._prepare_mpd_config(url, clearkey, extractor, max_res)
         else:
-            return self._prepare_hls_config(url, stream_type)
+            return self._prepare_hls_config(url, stream_type, extractor, max_res)
 
     async def _prepare_mpd_config(
         self,
         url: str,
-        clearkey: Optional[str] = None
+        clearkey: Optional[str] = None,
+        extractor: Optional[str] = None,
+        max_res: bool = False
     ) -> StreamConfig:
         """
         Prepare configuration for MPD/DASH streams.
 
         MPD streams are converted to HLS by the proxy and may have:
         - ClearKey DRM requiring decryption parameters
-        - Separate audio tracks requiring dual-input FFmpeg
+        - Separate audio tracks requiring dual-input recorder
         """
-        proxy_params = self._build_proxy_params(url)
+        proxy_params = self._build_proxy_params(url, extractor, max_res)
 
         # Add ClearKey parameters for DRM-protected streams
         if clearkey and ':' in clearkey:
             key_id, key = clearkey.split(':', 1)
             proxy_params['key_id'] = key_id
             proxy_params['key'] = key
-            logger.info("🔐 MPD Recording with ClearKey decryption enabled")
+            logger.debug("🔐 MPD Recording with ClearKey decryption enabled")
         else:
             logger.warning("⚠️ MPD Recording without ClearKey - content may be encrypted")
 
@@ -132,7 +149,7 @@ class RecordingManager:
             video_url = master_url
             audio_url = None
         else:
-            logger.info(f"Parsed MPD master: video=present, audio={'present' if audio_url else 'embedded'}")
+            logger.debug(f"Parsed MPD master: video=present, audio={'present' if audio_url else 'embedded'}")
 
         return StreamConfig(
             video_url=video_url,
@@ -142,14 +159,20 @@ class RecordingManager:
             needs_extended_probe=True
         )
 
-    def _prepare_hls_config(self, url: str, stream_type: StreamType) -> StreamConfig:
+    def _prepare_hls_config(
+        self,
+        url: str,
+        stream_type: StreamType,
+        extractor: Optional[str] = None,
+        max_res: bool = False
+    ) -> StreamConfig:
         """
         Prepare configuration for HLS streams (Vavoo, Freeshot, etc.).
 
         HLS streams typically have audio muxed with video, so no separate
         audio URL is needed.
         """
-        proxy_params = self._build_proxy_params(url)
+        proxy_params = self._build_proxy_params(url, extractor, max_res)
         video_url = f"http://127.0.0.1:{PORT}/proxy/hls/manifest.m3u8?{urlencode(proxy_params)}"
 
         logger.info(f"Recording HLS stream ({stream_type.value}): {url[:80]}...")
@@ -162,9 +185,26 @@ class RecordingManager:
             needs_extended_probe=False
         )
 
-    def _build_proxy_params(self, url: str) -> Dict[str, str]:
+    def _build_proxy_params(
+        self,
+        url: str,
+        extractor: Optional[str] = None,
+        max_res: bool = False
+    ) -> Dict[str, str]:
         """Build common proxy parameters."""
         params = {'d': url, 'no_bypass': '1'}
+        if extractor:
+            params['host'] = extractor
+        if max_res:
+            params['max_res'] = 'true'
+        # Routing flags live in the source URL query (appended by the start
+        # handlers). Promote them to the outer proxy request, otherwise the
+        # internal /proxy/... call never sees them.
+        flags = dict(parse_qsl(urlsplit(url).query))
+        if flags.get('warp') == 'off':
+            params['warp'] = 'off'
+        if flags.get('proxy') and flags['proxy'] != 'on':
+            params['proxy'] = flags['proxy']
         if API_PASSWORD:
             params['api_password'] = API_PASSWORD
         return params
@@ -185,11 +225,10 @@ class RecordingManager:
             audio_playlist_url may be None if audio is embedded in video
         """
         try:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(
-                    master_url,
-                    timeout=aiohttp.ClientTimeout(total=30)
-                ) as resp:
+            async with self.session.get(
+                master_url,
+                timeout=aiohttp.ClientTimeout(total=30)
+            ) as resp:
                     if resp.status != 200:
                         logger.error(f"Failed to fetch master playlist: {resp.status}")
                         return None, None
@@ -291,7 +330,7 @@ class RecordingManager:
         if config.audio_url:
             # Dual-input: video from input 0, audio from input 1
             cmd.extend(["-map", "0:v:0", "-map", "1:a:0"])
-            logger.info("Using dual-input mode: video + separate audio")
+            logger.debug("Using dual-input mode: video + separate audio")
         else:
             # Single input: video and optional audio from same input
             cmd.extend(["-map", "0:v:0", "-map", "0:a:0?"])
@@ -311,7 +350,9 @@ class RecordingManager:
         url: str,
         name: Optional[str] = None,
         duration: Optional[int] = None,
-        clearkey: Optional[str] = None
+        clearkey: Optional[str] = None,
+        extractor: Optional[str] = None,
+        max_res: bool = False
     ) -> Optional[Dict[str, Any]]:
         """
         Start recording a stream.
@@ -323,6 +364,8 @@ class RecordingManager:
             name: Human-readable name for the recording
             duration: Recording duration in seconds (None = max_duration)
             clearkey: ClearKey in format "key_id:key" for DRM-protected streams
+            extractor: Force a specific extractor (host) instead of auto-detection
+            max_res: Record only the highest video variant
 
         Returns:
             Recording info dict or None if failed
@@ -338,16 +381,20 @@ class RecordingManager:
             return None
 
         filename = self._generate_filename(recording_id, name)
-        file_path = os.path.join(self.recordings_dir, filename)
+        recordings_dir = config_store.get("recordings_dir", self.recordings_dir)
+        file_path = os.path.join(recordings_dir, filename)
+        if not os.path.exists(recordings_dir):
+            os.makedirs(recordings_dir)
 
         # Apply duration limits
+        max_duration = config_store.get("max_recording_duration", 28800)
         if duration:
-            duration = min(duration, self.max_duration)
+            duration = min(duration, max_duration)
         else:
-            duration = self.max_duration
+            duration = max_duration
 
         # Prepare stream-specific configuration
-        config = await self._prepare_stream_config(url, clearkey)
+        config = await self._prepare_stream_config(url, clearkey, extractor, max_res)
 
         # Build FFmpeg command
         cmd = self._build_ffmpeg_command(config, file_path, duration)
@@ -373,7 +420,8 @@ class RecordingManager:
                 pid=process.pid
             )
 
-            asyncio.create_task(self._monitor_recording(recording_id, process))
+            task = asyncio.create_task(self._monitor_recording(recording_id, process))
+            self._monitor_tasks[recording_id] = task
 
             return self.db.get_recording(recording_id)
 
@@ -386,7 +434,7 @@ class RecordingManager:
         """
         Stop an active recording.
 
-        Supports multi-worker: if process not in local dict, use PID from DB.
+        If process not in local dict, use PID from DB.
         """
         recording = self.db.get_recording(recording_id)
         if not recording:
@@ -396,7 +444,6 @@ class RecordingManager:
         if recording_id in self.processes:
             process = self.processes[recording_id]
             try:
-                # Send 'q' to FFmpeg for graceful shutdown
                 if process.stdin:
                     process.stdin.write(b'q')
                     await process.stdin.drain()
@@ -421,6 +468,9 @@ class RecordingManager:
             finally:
                 self.processes.pop(recording_id, None)
                 self.start_times.pop(recording_id, None)
+                task = self._monitor_tasks.pop(recording_id, None)
+                if task and not task.done():
+                    task.cancel()
         else:
             # Process in different worker - use PID from database
             pid = recording.get('pid')
@@ -431,9 +481,9 @@ class RecordingManager:
                     await asyncio.sleep(2)
                     if self.db.is_pid_running(pid):
                         os.kill(pid, signal.SIGKILL)
-                    logger.info(f"Stopped recording {recording_id} via PID {pid}")
+                    logger.debug(f"Stopped recording {recording_id} via PID {pid}")
                 except ProcessLookupError:
-                    logger.info(f"Process {pid} already terminated")
+                    logger.debug(f"Process {pid} already terminated")
                 except Exception as e:
                     logger.error(f"Error killing process {pid}: {e}")
 
@@ -465,7 +515,7 @@ class RecordingManager:
             stderr_text = stderr.decode() if stderr else ""
 
             if stderr_text:
-                logger.info(f"Recording {recording_id} FFmpeg output: {stderr_text[:1000]}")
+                logger.debug(f"Recording {recording_id} recorder output: {stderr_text[:1000]}")
 
             if process.returncode == 0:
                 logger.info(f"Recording {recording_id} completed successfully")
@@ -490,6 +540,7 @@ class RecordingManager:
         finally:
             self.processes.pop(recording_id, None)
             self.start_times.pop(recording_id, None)
+            self._monitor_tasks.pop(recording_id, None)
 
     async def delete_recording(self, recording_id: str) -> bool:
         """Delete a recording and its file."""
@@ -503,7 +554,7 @@ class RecordingManager:
         if recording.get('file_path') and os.path.exists(recording['file_path']):
             try:
                 os.remove(recording['file_path'])
-                logger.info(f"Deleted recording file: {recording['file_path']}")
+                logger.debug(f"Deleted recording file: {recording['file_path']}")
             except Exception as e:
                 logger.error(f"Error deleting file: {e}")
 
@@ -553,7 +604,8 @@ class RecordingManager:
 
     async def cleanup_old_recordings(self):
         """Delete recordings older than retention period."""
-        old_recordings = self.db.get_old_recordings(self.retention_days)
+        retention = config_store.get("recordings_retention_days", 7)
+        old_recordings = self.db.get_old_recordings(retention)
         for recording in old_recordings:
             logger.info(f"Auto-deleting old recording: {recording['id']}")
             await self.delete_recording(recording['id'])
@@ -567,11 +619,26 @@ class RecordingManager:
                 logger.error(f"Error in cleanup loop: {e}")
             await asyncio.sleep(3600)
 
+    def start_cleanup_loop(self):
+        """Start the maintenance loop once and retain it for clean shutdown."""
+        if self._cleanup_task is None or self._cleanup_task.done():
+            self._cleanup_task = asyncio.create_task(self.cleanup_loop())
+
     async def shutdown(self):
         """Gracefully stop all recordings on shutdown."""
         logger.info("Shutting down RecordingManager...")
+        if self._cleanup_task and not self._cleanup_task.done():
+            self._cleanup_task.cancel()
+            await asyncio.gather(self._cleanup_task, return_exceptions=True)
+        self._cleanup_task = None
         for recording_id in list(self.processes.keys()):
             await self.stop_recording(recording_id)
+        for task in list(self._monitor_tasks.values()):
+            if not task.done():
+                task.cancel()
+        if self._monitor_tasks:
+            await asyncio.wait(list(self._monitor_tasks.values()), timeout=5)
+        await self.close()
 
     # =========================================================================
     # Helper Methods

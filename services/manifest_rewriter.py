@@ -3,8 +3,32 @@ import re
 import urllib.parse
 import xml.etree.ElementTree as ET
 from urllib.parse import urljoin
+from services.secure_state import seal_state
 
 logger = logging.getLogger(__name__)
+
+
+def _keep_best_representation(root, namespace: str) -> None:
+    """Keep only the highest-bandwidth Representation of every AdaptationSet.
+
+    The HLS rewriter already serves just the max variant, so pruning here
+    keeps DASH output consistent instead of letting ABR start lower.
+    """
+    for adaptation_set in root.iter(namespace + "AdaptationSet"):
+        representations = adaptation_set.findall(namespace + "Representation")
+        if len(representations) < 2:
+            continue
+
+        def _bandwidth(representation):
+            try:
+                return int(representation.get("bandwidth") or 0)
+            except (TypeError, ValueError):
+                return 0
+
+        best = max(representations, key=_bandwidth)
+        for representation in representations:
+            if representation is not best:
+                adaptation_set.remove(representation)
 
 # Conditional import for DLHD detection
 # (Rimosso perche non serve piu logica speciale per DLHD nel rewriter)
@@ -16,6 +40,172 @@ except ImportError:
 
 class ManifestRewriter:
     @staticmethod
+    def _inherit_query_if_missing(absolute_url: str, base_query: str) -> str:
+        if not base_query:
+            return absolute_url
+        parsed_url = urllib.parse.urlparse(absolute_url)
+        if parsed_url.query:
+            return absolute_url
+        # okcdn (ok.ru) firma il token nel path (/expires/.../video/): aggiungere la
+        # query del manifest padre fa rispondere il master (o uno stub di errore).
+        hostname = (parsed_url.hostname or "").lower()
+        if hostname == "okcdn.ru" or hostname.endswith(".okcdn.ru"):
+            return absolute_url
+        return urllib.parse.urlunparse(parsed_url._replace(query=base_query))
+
+    @staticmethod
+    def _required_hls_version(manifest_content: str) -> int:
+        """Compute the minimum HLS version required by the tags in the manifest."""
+        version = 3
+        m = re.search(r'#EXT-X-VERSION:(\d+)', manifest_content)
+        if m:
+            version = max(version, int(m.group(1)))
+        if '#EXT-X-MEDIA:' in manifest_content or \
+           '#EXT-X-I-FRAME-STREAM-INF:' in manifest_content or \
+           '#EXT-X-BYTERANGE' in manifest_content:
+            version = max(version, 4)
+        if '#EXT-X-MAP:' in manifest_content:
+            version = max(version, 6)
+        return version
+
+    @staticmethod
+    def _ensure_hls_version(manifest_content: str) -> str:
+        """Make sure the manifest has a correct #EXT-X-VERSION line after #EXTM3U."""
+        version = ManifestRewriter._required_hls_version(manifest_content)
+        lines = manifest_content.split("\n")
+        new_lines = []
+        has_version = False
+        for line in lines:
+            stripped = line.strip()
+            if stripped == "#EXTM3U":
+                new_lines.append(line)
+                new_lines.append(f"#EXT-X-VERSION:{version}")
+                continue
+            if stripped.startswith("#EXT-X-VERSION:"):
+                has_version = True
+                continue
+            new_lines.append(line)
+        if not new_lines:
+            return f"#EXTM3U\n#EXT-X-VERSION:{version}"
+        return "\n".join(new_lines)
+
+    @staticmethod
+    def rewrite_mpd_native(
+        manifest_content: str,
+        mpd_url: str,
+        proxy_base: str,
+        stream_headers: dict,
+        clearkey_param: str = None,
+        api_password: str = None,
+        bypass_warp: bool = False,
+        disable_ssl: bool = False,
+        session_id: str = None,
+        forced_proxy: str = None,
+        bypass_proxies: bool = False,
+        extractor_key: str = None,
+        stream_key: str = None,
+        max_res: bool = False,
+    ) -> str:
+        """Riscrive il manifest MPD per DASH nativo (senza conversione HLS)."""
+        import copy
+        from services.proxy_dash import _encode_dash_state
+
+        root = ET.fromstring(manifest_content)
+        namespace = root.tag.split("}")[0] + "}" if "}" in root.tag else ""
+        if max_res:
+            _keep_best_representation(root, namespace)
+
+        def relay(absolute, init_url=None, init_range=None):
+            parsed = urllib.parse.urlsplit(absolute)
+            path = parsed.path or "/"
+            if "/" in path:
+                directory, tail = path.rsplit("/", 1)
+            else:
+                directory, tail = "", path
+            base_dir = (directory + "/") if not directory.endswith("/") else directory
+            base_directory = urllib.parse.urlunsplit((parsed.scheme, parsed.netloc, base_dir, "", ""))
+            if parsed.query:
+                tail += "?" + parsed.query
+            token = _encode_dash_state(base_directory, stream_headers, clearkey_param,
+                resource_url=absolute, init_url=init_url, init_range=init_range,
+                proxy=forced_proxy, bypass_warp=bypass_warp,
+                bypass_proxies=bypass_proxies, extractor_key=extractor_key,
+                stream_key=stream_key)
+            # Keep the token path opaque: source query parameters belong in
+            # authenticated state, not in the public relay URL query string.
+            safe_tail = urllib.parse.quote(tail or "segment.mp4", safe="._-~$")
+            return f"{proxy_base}/proxy/mpd/segment/{token}/{safe_tail}"
+
+        def walk(node, base, inherited=None):
+            bases = node.findall(namespace + "BaseURL")
+            if bases:
+                base = urljoin(base, bases[0].text or "")
+            template = node.find(namespace + "SegmentTemplate")
+            if template is None:
+                template = node.find(namespace + "SegmentList")
+            if template is None:
+                template = node.find(namespace + "SegmentBase")
+            effective = copy.deepcopy(inherited) if inherited is not None else None
+            if template is not None:
+                if effective is None or effective.tag != template.tag:
+                    effective = copy.deepcopy(template)
+                else:
+                    effective.attrib.update(template.attrib)
+                    if len(template):
+                        effective[:] = copy.deepcopy(list(template))
+            for child in list(node):
+                if child.tag in (namespace + "Period", namespace + "AdaptationSet", namespace + "Representation"):
+                    walk(child, base, effective)
+            if node.tag == namespace + "Representation":
+                if effective is None:
+                    if clearkey_param:
+                        raise ValueError("ClearKey DASH requires initialization metadata")
+                    ET.SubElement(node, namespace + "BaseURL").text = relay(base)
+                elif effective.tag != namespace + "SegmentTemplate":
+                    init = effective.find(namespace + "Initialization")
+                    init_url = urljoin(base, init.get("sourceURL", "") or "") if init is not None else None
+                    if clearkey_param and not init_url:
+                        init_url = base
+                    init_range = init.get("range") if init is not None else None
+                    if clearkey_param and init is None:
+                        raise ValueError("ClearKey DASH requires initialization metadata")
+                    if init is not None and init.get("sourceURL"):
+                        init.set("sourceURL", relay(init_url, init_url, init_range))
+                    for segment in effective.findall(namespace + "SegmentURL"):
+                        for attr in ("media", "index"):
+                            if segment.get(attr):
+                                segment.set(attr, relay(urljoin(base, segment.get(attr)), init_url, init_range))
+                    if effective.tag == namespace + "SegmentBase" or (init is not None and not init.get("sourceURL")):
+                        ET.SubElement(node, namespace + "BaseURL").text = relay(base, init_url, init_range)
+                    node.append(effective)
+                else:
+                    rewrite_template(node, effective, base)
+            for child in list(node):
+                if child in bases or child is template:
+                    node.remove(child)
+                elif clearkey_param and child.tag.rsplit("}", 1)[-1] in ("ContentProtection", "pssh"):
+                    node.remove(child)
+
+        def rewrite_template(node, effective, base):
+                def expand(value):
+                    return value.replace("$RepresentationID$", node.get("id", "")).replace(
+                        "$Bandwidth$", node.get("bandwidth", ""))
+                init = effective.get("initialization")
+                init_url = urljoin(base, expand(init)) if init else None
+                init_range = effective.get("initializationRange") or effective.get("range")
+                if clearkey_param and not init_url:
+                    raise ValueError("ClearKey DASH requires explicit initialization")
+                for attr in ("media", "initialization"):
+                    if not effective.get(attr):
+                        continue
+                    absolute = urljoin(base, expand(effective.get(attr)))
+                    effective.set(attr, relay(absolute, init_url, init_range))
+                node.append(effective)
+
+        walk(root, mpd_url)
+        return ET.tostring(root, encoding="unicode")
+
+    @staticmethod
     def rewrite_mpd_manifest(
         manifest_content: str,
         base_url: str,
@@ -23,9 +213,20 @@ class ManifestRewriter:
         stream_headers: dict,
         clearkey_param: str = None,
         api_password: str = None,
+        bypass_warp: bool = False,
+        bypass_proxies: bool = False,
+        disable_ssl: bool = False,
+        drm_token: str = None,
+        extractor_key: str = None,
+        stream_key: str = None,
+        max_res: bool = False,
     ) -> str:
         """Riscrive i manifest MPD (DASH) per passare attraverso il proxy."""
         try:
+            if clearkey_param and not drm_token:
+                drm_token = seal_state(
+                    {"clearkey": clearkey_param}, "clearkey"
+                )
             # Aggiungiamo il namespace di default se non presente, per ET
             if "xmlns" not in manifest_content:
                 manifest_content = manifest_content.replace(
@@ -33,6 +234,10 @@ class ManifestRewriter:
                 )
 
             root = ET.fromstring(manifest_content)
+            if max_res:
+                _keep_best_representation(
+                    root, root.tag.split("}")[0] + "}" if "}" in root.tag else ""
+                )
             ns = {
                 "mpd": "urn:mpeg:dash:schema:mpd:2011",
                 "cenc": "urn:mpeg:cenc:2013",
@@ -54,6 +259,24 @@ class ManifestRewriter:
 
             if api_password:
                 header_params += f"&api_password={api_password}"
+            if drm_token:
+                header_params += (
+                    f"&drm_token={urllib.parse.quote(drm_token, safe='')}"
+                )
+            
+            if bypass_warp:
+                header_params += "&warp=off"
+            if bypass_proxies:
+                header_params += "&proxy=off"
+
+            if disable_ssl:
+                header_params += "&disable_ssl=1"
+            if extractor_key:
+                header_params += f"&extractor_key={urllib.parse.quote(extractor_key, safe='')}"
+            if stream_key:
+                header_params += f"&stream_key={urllib.parse.quote(stream_key, safe='')}"
+            if max_res:
+                header_params += "&max_res=true"
 
             def create_proxy_url(relative_url):
                 # Skip proxying if URL contains DASH template variables - player must resolve these
@@ -87,7 +310,10 @@ class ManifestRewriter:
                     cp_element.set("value", "ClearKey")
 
                     # Puntiamo al nostro endpoint /license
-                    license_url = f"{proxy_base}/license?clearkey={clearkey_param}"
+                    license_url = (
+                        f"{proxy_base}/license?drm_token="
+                        f"{urllib.parse.quote(drm_token, safe='')}"
+                    )
                     if api_password:
                         license_url += f"&api_password={api_password}"
 
@@ -116,7 +342,7 @@ class ManifestRewriter:
 
                     # Inietta ContentProtection
                     adaptation_sets = root.findall(".//mpd:AdaptationSet", ns)
-                    logger.info(
+                    logger.debug(
                         f"Found {len(adaptation_sets)} AdaptationSet in manifest."
                     )
 
@@ -126,7 +352,7 @@ class ManifestRewriter:
                             scheme = cp.get("schemeIdUri", "").lower()
                             if "e2719d58-a985-b3c9-781a-007147f192ec" not in scheme:
                                 adaptation_set.remove(cp)
-                                logger.info(
+                                logger.debug(
                                     f"Removed conflicting ContentProtection: {scheme}"
                                 )
 
@@ -142,7 +368,7 @@ class ManifestRewriter:
 
                         if not existing_cp:
                             adaptation_set.insert(0, cp_element)
-                            logger.info(
+                            logger.debug(
                                 "Injected static ClearKey ContentProtection in AdaptationSet"
                             )
 
@@ -161,7 +387,7 @@ class ManifestRewriter:
                             f"{proxy_base}/license?url={encoded_license_url}{header_params}"
                         )
                         child.text = proxy_license_url
-                        logger.info(
+                        logger.debug(
                             f"Redirected License URL: {original_license_url} -> {proxy_license_url}"
                         )
 
@@ -195,100 +421,199 @@ class ManifestRewriter:
         api_password: str = None,
         get_extractor_func=None,
         no_bypass: bool = False,
+        shorten_url_func=None,
+        bypass_warp: bool = False,
+        bypass_proxies: bool = False,
+        disable_ssl: bool = False,
+        selected_proxy: str = None,
+        force_direct: bool = False,
+        extractor_key: str = None,
+        stream_key: str = None,
+        max_res: bool = False,
     ) -> str:
         """Riscrive gli URL nei manifest HLS per passare attraverso il proxy."""
         lines = manifest_content.split("\n")
         rewritten_lines = []
 
-        # Determina se e VixSrc (logica speciale per quality selection)
-        is_vixsrc_stream = False
-        logger.info(f"Manifest rewriter called with base_url: {base_url}")
-
-        try:
-            if get_extractor_func:
-                original_request_url = (
-                    stream_headers.get("referer")
-                    or stream_headers.get("Referer")
-                    or base_url
-                )
-                extractor = await get_extractor_func(original_request_url, {})
-
-                if hasattr(extractor, "is_vixsrc") and extractor.is_vixsrc:
-                    is_vixsrc_stream = True
-                    logger.info("Detected VixSrc stream.")
-        except Exception as e:
-            logger.error(f"Error in extractor detection: {e}")
-
         # no_bypass e mantenuto per compatibilita, ma il rewriter ora proxa sempre.
         _ = no_bypass
 
-        # Logica speciale SOLO per VixSrc (filtro qualita)
-        if is_vixsrc_stream:
-            streams = []
-            for i, line in enumerate(lines):
-                if line.startswith("#EXT-X-STREAM-INF:"):
-                    bandwidth_match = re.search(r"BANDWIDTH=(\d+)", line)
-                    if bandwidth_match and i + 1 < len(lines):
-                        bandwidth = int(bandwidth_match.group(1))
-                        streams.append(
-                            {
-                                "bandwidth": bandwidth,
-                                "inf": line,
-                                "url": lines[i + 1],
-                            }
-                        )
-
-            if streams:
-                highest_quality_stream = max(streams, key=lambda x: x["bandwidth"])
-                logger.info(
-                    f"VixSrc: Selected bandwidth {highest_quality_stream['bandwidth']}."
-                )
-                header_params = "".join(
-                    [
-                        f"&h_{urllib.parse.quote(key, safe='')}={urllib.parse.quote(str(value), safe='')}"
-                        for key, value in stream_headers.items()
-                    ]
-                )
-                if api_password:
-                    header_params += f"&api_password={api_password}"
-
-                absolute_stream_url = urljoin(base_url, highest_quality_stream["url"])
-                encoded_stream_url = urllib.parse.quote(absolute_stream_url, safe="")
-                proxied_stream_url = (
-                    f"{proxy_base}/proxy/hls/manifest.m3u8?d={encoded_stream_url}{header_params}"
+        # max_res=true: keep only the highest-bandwidth video variant.
+        # Default: keep every variant so the player can adapt (ABR).
+        generic_streams = []
+        for i, line in enumerate(lines):
+            if line.startswith("#EXT-X-STREAM-INF:") and i + 1 < len(lines):
+                bandwidth_match = re.search(r"BANDWIDTH=(\d+)", line)
+                bandwidth = int(bandwidth_match.group(1)) if bandwidth_match else 0
+                generic_streams.append(
+                    {
+                        "index": i,
+                        "bandwidth": bandwidth,
+                        "inf": line,
+                        "url": lines[i + 1],
+                    }
                 )
 
-                proxied_media_lines = []
-                for line in lines:
-                    if not line.startswith("#EXT-X-MEDIA:") or 'URI="' not in line:
-                        continue
+        if generic_streams and max_res:
+            highest_quality_stream = max(generic_streams, key=lambda x: x["bandwidth"])
+            logger.debug(
+                "Generic HLS: selected max bandwidth %s.",
+                highest_quality_stream["bandwidth"],
+            )
+            # Warn if the CDN is serving an audio-only stream. Consider video proven either
+            # by an explicit CODECS= video entry or by a RESOLUTION= attribute (many CDNs
+            # omit CODECS while still serving video, so RESOLUTION is enough evidence).
+            _selected_inf = highest_quality_stream["inf"]
+            _has_video_codec = any(
+                vc in _selected_inf for vc in ("avc1", "hvc1", "dvh1", "hev1", "vp9", "av01")
+            ) or re.search(r"RESOLUTION=\d+x\d+", _selected_inf) is not None
+            if not _has_video_codec:
+                logger.warning(
+                    "HLS master manifest has no video codec in selected variant (CDN may be serving audio-only). "
+                    "STREAM-INF: %s", _selected_inf
+                )
+            base_query = urllib.parse.urlparse(base_url).query
 
-                    uri_start = line.find('URI="') + 5
-                    uri_end = line.find('"', uri_start)
-                    if uri_start <= 4 or uri_end <= uri_start:
-                        proxied_media_lines.append(line)
-                        continue
+            header_params = "".join(
+                [
+                    f"&h_{urllib.parse.quote(key, safe='')}={urllib.parse.quote(str(value), safe='')}"
+                    for key, value in stream_headers.items()
+                ]
+            )
 
-                    absolute_media_url = urljoin(base_url, line[uri_start:uri_end])
-                    encoded_media_url = urllib.parse.quote(absolute_media_url, safe="")
+            if api_password:
+                header_params += f"&api_password={api_password}"
+            
+            if bypass_warp:
+                header_params += "&warp=off"
+            if bypass_proxies:
+                header_params += "&proxy=off"
+            
+            if disable_ssl:
+                header_params += "&disable_ssl=1"
+            
+            if selected_proxy and not bypass_proxies:
+                # Usiamo un formato pulito per evitare double-encoding
+                header_params += f"&proxy={urllib.parse.quote(selected_proxy, safe='')}"
+            if force_direct:
+                header_params += "&direct=1"
+            if original_channel_url:
+                header_params += f"&orig_url={urllib.parse.quote(original_channel_url, safe='')}"
+            if extractor_key:
+                header_params += f"&extractor_key={urllib.parse.quote(extractor_key, safe='')}"
+            if stream_key:
+                header_params += f"&stream_key={urllib.parse.quote(stream_key, safe='')}"
+            if max_res:
+                header_params += "&max_res=true"
+
+            absolute_variant_url = ManifestRewriter._inherit_query_if_missing(
+                urljoin(base_url, highest_quality_stream["url"]),
+                base_query,
+            )
+            if shorten_url_func:
+                url_id = await shorten_url_func(absolute_variant_url)
+                proxy_variant_url = f"{proxy_base}/proxy/hls/manifest.m3u8?hls_url_id={url_id}{header_params}"
+            else:
+                encoded_variant_url = urllib.parse.quote(absolute_variant_url, safe="")
+                proxy_variant_url = (
+                    f"{proxy_base}/proxy/hls/manifest.m3u8?d={encoded_variant_url}{header_params}"
+                )
+            
+            if selected_proxy and not bypass_proxies and "&proxy=" not in proxy_variant_url:
+                proxy_variant_url += f"&proxy={urllib.parse.quote(selected_proxy, safe='')}"
+
+            proxied_media_lines = []
+            is_dlstreams_or_premium = "dlstreams" in base_url.lower() or "dlhd" in base_url.lower() or "/premium" in base_url.lower()
+            # Track which group-ids survive filtering (have at least one proxied media line)
+            surviving_group_ids = set()
+            for line in lines:
+                if not line.startswith("#EXT-X-MEDIA:"):
+                    continue
+                if 'URI="' not in line:
+                    # Media without URI (e.g. closed-captions=NONE): keep as-is and track group
+                    group_match = re.search(r'GROUP-ID="([^"]+)"', line)
+                    if group_match:
+                        surviving_group_ids.add(group_match.group(1))
+                    proxied_media_lines.append(line.strip())
+                    continue
+
+                uri_start = line.find('URI="') + 5
+                uri_end = line.find('"', uri_start)
+                if uri_start <= 4 or uri_end <= uri_start:
+                    group_match = re.search(r'GROUP-ID="([^"]+)"', line)
+                    if group_match:
+                        surviving_group_ids.add(group_match.group(1))
+                    proxied_media_lines.append(line.strip())
+                    continue
+                # Filter out unsigned/broken media tracks for DLStreams/premium streams.
+                # Tracks without explicit query parameters (e.g. ?md5=...) always return 403 Forbidden.
+                original_uri = line[uri_start:uri_end]
+                if is_dlstreams_or_premium and "?" not in original_uri:
+                    continue
+
+                media_url = ManifestRewriter._inherit_query_if_missing(
+                    urljoin(base_url, line[uri_start:uri_end]),
+                    base_query,
+                )
+                if shorten_url_func:
+                    url_id = await shorten_url_func(media_url)
+                    proxy_media_url = f"{proxy_base}/proxy/hls/manifest.m3u8?hls_url_id={url_id}{header_params}"
+                else:
+                    encoded_media_url = urllib.parse.quote(media_url, safe="")
                     proxy_media_url = (
                         f"{proxy_base}/proxy/hls/manifest.m3u8?d={encoded_media_url}{header_params}"
                     )
-                    proxied_media_lines.append(
-                        line[:uri_start] + proxy_media_url + line[uri_end:]
-                    )
+                proxied_media_lines.append(line[:uri_start] + proxy_media_url + line[uri_end:])
+                group_match = re.search(r'GROUP-ID="([^"]+)"', line)
+                if group_match:
+                    surviving_group_ids.add(group_match.group(1))
 
-                rewritten_lines.append("#EXTM3U")
-                for line in lines:
-                    if line.startswith("#EXT-X-MEDIA:") or line.startswith(
-                        "#EXT-X-STREAM-INF:"
-                    ) or (line and not line.startswith("#")):
+            def _strip_empty_group_refs(inf_line: str, surviving: set) -> str:
+                """Remove SUBTITLES/AUDIO/CLOSED-CAPTIONS attributes that reference
+                group-ids which were completely filtered out. This prevents player
+                confusion (e.g. PotPlayer refusing video) when a STREAM-INF references
+                a group that has no matching EXT-X-MEDIA entries."""
+                for attr in ("SUBTITLES", "AUDIO", "CLOSED-CAPTIONS"):
+                    match = re.search(rf'{attr}="([^"]+)"', inf_line)
+                    if match and match.group(1) not in surviving:
+                        # Remove the attribute and any surrounding comma
+                        inf_line = re.sub(
+                            rf',?\s*{attr}="[^"]+"', "", inf_line
+                        ).strip().rstrip(",")
+                        logger.debug(
+                            "Stripped dangling %s group ref '%s' from STREAM-INF",
+                            attr, match.group(1),
+                        )
+                return inf_line
+
+            rewritten_lines.append("#EXTM3U")
+            skip_next_url = False
+            for i, line in enumerate(lines):
+                stripped = line.strip()
+                if skip_next_url:
+                    skip_next_url = False
+                    continue
+                if any(stream["index"] == i for stream in generic_streams):
+                    if i == highest_quality_stream["index"]:
+                        skip_next_url = True
                         continue
+                    skip_next_url = True
+                    continue
+                if stripped.startswith("#EXT-X-MEDIA:"):
+                    continue
+                if stripped.startswith("#EXT-X-I-FRAME-STREAM-INF:"):
+                    continue
+                if stripped == "#EXTM3U":
+                    continue
+                rewritten_lines.append(stripped)
 
-                rewritten_lines.extend(proxied_media_lines)
-                rewritten_lines.append(highest_quality_stream["inf"])
-                rewritten_lines.append(proxied_stream_url)
-                return "\n".join(rewritten_lines)
+            rewritten_lines.extend([line for line in proxied_media_lines if line])
+            # Strip dangling group refs from STREAM-INF before appending
+            cleaned_inf = _strip_empty_group_refs(highest_quality_stream["inf"], surviving_group_ids)
+            rewritten_lines.append(cleaned_inf)
+            rewritten_lines.append(proxy_variant_url)
+
+            return ManifestRewriter._ensure_hls_version("\n".join(rewritten_lines))
 
         # --- Logica Standard ---
         header_params = "".join(
@@ -300,22 +625,53 @@ class ManifestRewriter:
 
         if api_password:
             header_params += f"&api_password={api_password}"
+        
+        if bypass_warp:
+            header_params += "&warp=off"
+        if bypass_proxies:
+            header_params += "&proxy=off"
+        
+        if disable_ssl:
+            header_params += "&disable_ssl=1"
+        
+        if selected_proxy and not bypass_proxies:
+            header_params += f"&proxy={urllib.parse.quote(selected_proxy, safe='')}"
+        if force_direct:
+            header_params += "&direct=1"
+        if original_channel_url:
+            header_params += f"&orig_url={urllib.parse.quote(original_channel_url, safe='')}"
+        if extractor_key:
+            header_params += f"&extractor_key={urllib.parse.quote(extractor_key, safe='')}"
+        if stream_key:
+            header_params += f"&stream_key={urllib.parse.quote(stream_key, safe='')}"
+        if max_res:
+            header_params += "&max_res=true"
 
         # Estrai query params dal base_url per ereditarli se necessario
         base_parsed = urllib.parse.urlparse(base_url)
         base_query = base_parsed.query
 
+        next_uri_is_manifest = False
         for line in lines:
             line = line.strip()
 
+            if line.startswith("#EXT-X-STREAM-INF:"):
+                rewritten_lines.append(line)
+                next_uri_is_manifest = True
+                continue
+
             # 1. GESTIONE CHIAVI AES-128
             if line.startswith("#EXT-X-KEY:") and 'URI=' in line:
+                next_uri_is_manifest = False
                 uri_start = line.find('URI="') + 5
                 uri_end = line.find('"', uri_start)
 
                 if uri_start > 4 and uri_end > uri_start:
                     original_key_url = line[uri_start:uri_end]
-                    absolute_key_url = urljoin(base_url, original_key_url)
+                    absolute_key_url = ManifestRewriter._inherit_query_if_missing(
+                        urljoin(base_url, original_key_url),
+                        base_query,
+                    )
 
                     encoded_key_url = urllib.parse.quote(absolute_key_url, safe="")
                     encoded_original_channel_url = urllib.parse.quote(
@@ -339,45 +695,126 @@ class ManifestRewriter:
 
                     if api_password:
                         proxy_key_url += f"&api_password={api_password}"
+                    if bypass_warp:
+                        proxy_key_url += "&warp=off"
+                    if bypass_proxies:
+                        proxy_key_url += "&proxy=off"
+                    if disable_ssl:
+                        proxy_key_url += "&disable_ssl=1"
+                    if selected_proxy and not bypass_proxies:
+                        proxy_key_url += f"&proxy={urllib.parse.quote(selected_proxy, safe='')}"
+                    if force_direct:
+                        proxy_key_url += "&direct=1"
+                    if extractor_key:
+                        proxy_key_url += f"&extractor_key={urllib.parse.quote(extractor_key, safe='')}"
+                    if stream_key:
+                        proxy_key_url += f"&stream_key={urllib.parse.quote(stream_key, safe='')}"
 
                     new_line = line[:uri_start] + proxy_key_url + line[uri_end:]
                     rewritten_lines.append(new_line)
-                    logger.info(
-                        f"Redirected AES key: {absolute_key_url} -> {proxy_key_url}"
-                    )
                 else:
                     rewritten_lines.append(line)
 
             # 2. GESTIONE MEDIA (Sottotitoli, Audio secondario)
             elif line.startswith("#EXT-X-MEDIA:") and 'URI=' in line:
+                next_uri_is_manifest = False
                 uri_start = line.find('URI="') + 5
                 uri_end = line.find('"', uri_start)
 
                 if uri_start > 4 and uri_end > uri_start:
                     original_media_url = line[uri_start:uri_end]
-                    absolute_media_url = urljoin(base_url, original_media_url)
+                    absolute_media_url = ManifestRewriter._inherit_query_if_missing(
+                        urljoin(base_url, original_media_url),
+                        base_query,
+                    )
                     encoded_media_url = urllib.parse.quote(absolute_media_url, safe="")
 
                     # Usa endpoint manifest
-                    proxy_media_url = (
-                        f"{proxy_base}/proxy/hls/manifest.m3u8?d={encoded_media_url}{header_params}"
-                    )
+                    if shorten_url_func:
+                        url_id = await shorten_url_func(absolute_media_url)
+                        proxy_media_url = f"{proxy_base}/proxy/hls/manifest.m3u8?hls_url_id={url_id}{header_params}"
+                    else:
+                        proxy_media_url = (
+                            f"{proxy_base}/proxy/hls/manifest.m3u8?d={encoded_media_url}{header_params}"
+                        )
                     new_line = line[:uri_start] + proxy_media_url + line[uri_end:]
                     rewritten_lines.append(new_line)
-                    logger.info(
-                        f"Redirected Media URL: {absolute_media_url} -> {proxy_media_url}"
+                else:
+                    rewritten_lines.append(line)
+
+            # 2b. GESTIONE I-FRAME STREAMS
+            elif line.startswith("#EXT-X-I-FRAME-STREAM-INF:") and 'URI=' in line:
+                next_uri_is_manifest = False
+                uri_start = line.find('URI="') + 5
+                uri_end = line.find('"', uri_start)
+
+                if uri_start > 4 and uri_end > uri_start:
+                    original_iframe_url = line[uri_start:uri_end]
+                    absolute_iframe_url = ManifestRewriter._inherit_query_if_missing(
+                        urljoin(base_url, original_iframe_url),
+                        base_query,
                     )
+                    encoded_iframe_url = urllib.parse.quote(absolute_iframe_url, safe="")
+
+                    # Gli I-FRAME sono solitamente m3u8 o segmenti a sé stanti
+                    if shorten_url_func:
+                        url_id = await shorten_url_func(absolute_iframe_url)
+                        proxy_iframe_url = f"{proxy_base}/proxy/hls/manifest.m3u8?hls_url_id={url_id}{header_params}"
+                    else:
+                        proxy_iframe_url = (
+                            f"{proxy_base}/proxy/hls/manifest.m3u8?d={encoded_iframe_url}{header_params}"
+                        )
+                    new_line = line[:uri_start] + proxy_iframe_url + line[uri_end:]
+                    rewritten_lines.append(new_line)
+                else:
+                    rewritten_lines.append(line)
+
+            # 2c. GESTIONE SESSION-KEY
+            elif line.startswith("#EXT-X-SESSION-KEY:") and 'URI=' in line:
+                next_uri_is_manifest = False
+                uri_start = line.find('URI="') + 5
+                uri_end = line.find('"', uri_start)
+
+                if uri_start > 4 and uri_end > uri_start:
+                    original_key_url = line[uri_start:uri_end]
+                    absolute_key_url = ManifestRewriter._inherit_query_if_missing(
+                        urljoin(base_url, original_key_url),
+                        base_query,
+                    )
+                    encoded_key_url = urllib.parse.quote(absolute_key_url, safe="")
+                    
+                    # Proxy KEY URL (come per #EXT-X-KEY)
+                    proxy_key_url = (
+                        f"{proxy_base}/key?key_url={encoded_key_url}"
+                        f"&h_Referer={urllib.parse.quote(base_url, safe='')}"
+                    )
+                    proxy_key_url += header_params
+                    if api_password:
+                        proxy_key_url += f"&api_password={api_password}"
+                    if bypass_warp:
+                        proxy_key_url += "&warp=off"
+                    if bypass_proxies:
+                        proxy_key_url += "&proxy=off"
+                    if disable_ssl:
+                        proxy_key_url += "&disable_ssl=1"
+
+                    new_line = line[:uri_start] + proxy_key_url + line[uri_end:]
+                    rewritten_lines.append(new_line)
                 else:
                     rewritten_lines.append(line)
 
             # 3. GESTIONE MAP (Init Segment per fMP4)
             elif line.startswith("#EXT-X-MAP:") and 'URI=' in line:
+                next_uri_is_manifest = False
                 uri_start = line.find('URI="') + 5
                 uri_end = line.find('"', uri_start)
 
                 if uri_start > 4 and uri_end > uri_start:
                     original_map_url = line[uri_start:uri_end]
-                    absolute_map_url = urljoin(base_url, original_map_url)
+                    absolute_map_url = ManifestRewriter._inherit_query_if_missing(
+                        urljoin(base_url, original_map_url),
+                        base_query,
+                    )
                     encoded_map_url = urllib.parse.quote(absolute_map_url, safe="")
 
                     # Usa endpoint segment.mp4
@@ -387,9 +824,6 @@ class ManifestRewriter:
 
                     new_line = line[:uri_start] + proxy_map_url + line[uri_end:]
                     rewritten_lines.append(new_line)
-                    logger.info(
-                        f"Redirected MAP URL: {absolute_map_url} -> {proxy_map_url}"
-                    )
                 else:
                     rewritten_lines.append(line)
 
@@ -398,21 +832,41 @@ class ManifestRewriter:
                 absolute_url = urljoin(base_url, line) if not line.startswith("http") else line
 
                 # Eredita query params (es. token)
-                if base_query and "?" not in absolute_url:
-                    absolute_url += f"?{base_query}"
+                absolute_url = ManifestRewriter._inherit_query_if_missing(
+                    absolute_url,
+                    base_query,
+                )
+
+                # Variant URIs after #EXT-X-STREAM-INF are playlists even when
+                # providers like VixSrc expose them as extensionless /playlist URLs.
+                is_manifest_uri = next_uri_is_manifest or ".m3u8" in absolute_url
+                next_uri_is_manifest = False
+
+                if not is_manifest_uri and (extractor_key == "fctv33" or ("_ctump=" in absolute_url and "_ctuph=" in absolute_url)):
+                    try:
+                        from extractors.fctv33 import resolve_fctv33_segment_url
+                        absolute_url = resolve_fctv33_segment_url(absolute_url)
+                    except Exception as _fctv_err:
+                        logger.debug("Failed to resolve FCTV33 segment in manifest: %s", _fctv_err)
 
                 encoded_url = urllib.parse.quote(absolute_url, safe="")
 
-                # Se e .m3u8 usa /proxy/manifest.m3u8, altrimenti determina estensione
-                if ".m3u8" in absolute_url:
-                    proxy_url = (
-                        f"{proxy_base}/proxy/manifest.m3u8?url={encoded_url}{header_params}"
-                    )
+                # Se e manifest usa /proxy/hls/manifest.m3u8, altrimenti determina estensione
+                if is_manifest_uri:
+                    if shorten_url_func:
+                        url_id = await shorten_url_func(absolute_url)
+                        proxy_url = f"{proxy_base}/proxy/hls/manifest.m3u8?hls_url_id={url_id}{header_params}"
+                    else:
+                        proxy_url = (
+                            f"{proxy_base}/proxy/hls/manifest.m3u8?d={encoded_url}{header_params}"
+                        )
                 else:
-                    # Se l'URL originale ha estensione mp4/m4s, usa .mp4, altrimenti default a .ts
+                    # Mantieni un endpoint coerente con il tipo reale del segmento
                     path = urllib.parse.urlparse(absolute_url).path
                     ext = ".ts"
-                    if (
+                    if path.endswith(".vtt") or path.endswith(".webvtt"):
+                        ext = ".vtt"
+                    elif (
                         path.endswith(".m4s")
                         or path.endswith(".mp4")
                         or path.endswith(".m4v")
@@ -426,7 +880,8 @@ class ManifestRewriter:
                 rewritten_lines.append(proxy_url)
 
             else:
+                next_uri_is_manifest = False
                 # Tutti gli altri tag (es. #EXTINF, #EXT-X-ENDLIST)
                 rewritten_lines.append(line)
 
-        return "\n".join(rewritten_lines)
+        return ManifestRewriter._ensure_hls_version("\n".join(rewritten_lines))

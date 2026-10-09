@@ -1,70 +1,167 @@
-import logging
-import random
-import re
 import base64
 import json
+import logging
+import re
 from urllib.parse import urljoin
-from aiohttp import ClientSession, ClientTimeout, TCPConnector
-from aiohttp_socks import ProxyConnector
+from extractors.base import BaseExtractor, ExtractorError
 
 logger = logging.getLogger(__name__)
 
-class ExtractorError(Exception):
-    pass
-
-class VoeExtractor:
+class VoeExtractor(BaseExtractor):
     def __init__(self, request_headers: dict, proxies: list = None):
-        self.request_headers = request_headers
-        self.base_headers = {
-            "user-agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
-        }
-        self.session = None
-        self.mediaflow_endpoint = "hls_proxy"
-        self.proxies = proxies or []
+        super().__init__(request_headers, proxies, extractor_name="voe")
 
-    def _get_random_proxy(self):
-        return random.choice(self.proxies) if self.proxies else None
-
-    async def _get_session(self):
-        if self.session is None or self.session.closed:
-            timeout = ClientTimeout(total=60, connect=30, sock_read=30)
-            proxy = self._get_random_proxy()
-            if proxy:
-                connector = ProxyConnector.from_url(proxy)
-            else:
-                connector = TCPConnector(limit=0, limit_per_host=0, keepalive_timeout=60, enable_cleanup_closed=True, force_close=False, use_dns_cache=True)
-
-            self.session = ClientSession(timeout=timeout, connector=connector, headers={'User-Agent': self.base_headers["user-agent"]})
-        return self.session
+    async def _fetch_external_scripts(self, url: str, text: str) -> list[str]:
+        """Fetch all external JS files linked in the page and return their content."""
+        results = []
+        script_srcs = re.findall(r'<script[^>]*src=["\']([^"\']+)["\']', text)
+        for src in script_srcs:
+            try:
+                script_url = urljoin(url, src)
+                resp = await self._make_request(script_url)
+                results.append(resp.text)
+            except Exception as e:
+                logger.debug(f"VOE: failed to fetch external script {src}: {e}")
+        return results
 
     async def extract(self, url: str, redirect_count: int = 0, **kwargs) -> dict:
-        session = await self._get_session()
-        async with session.get(url) as response:
-            text = await response.text()
+        self._apply_routing_kwargs(url, kwargs)
+        resp = await self._make_request(url)
+        text = resp.text
 
-        # See https://github.com/Gujal00/ResolveURL/blob/master/script.module.resolveurl/lib/resolveurl/plugins/voesx.py
-        redirect_pattern = r'''window\.location\.href\s*=\s*'([^']+)'''
-        redirect_match = re.search(redirect_pattern, text, re.DOTALL)
-        if redirect_match:
-            if redirect_count >= 5:
-                raise ExtractorError("VOE: too many redirects")
-            return await self.extract(redirect_match.group(1), redirect_count=redirect_count + 1)
+        # 1. Handle JS redirects
+        redirect_patterns = [
+            r'''window\.location\.href\s*=\s*'([^']+)''',
+            r'''window\.location\s*=\s*'([^']+)''',
+            r'''location\.href\s*=\s*'([^']+)''',
+            r'''window\.location\.replace\('([^']+)'\)''',
+            r'''window\.location\.assign\('([^']+)'\)''',
+            r'''window\.location\s*=\s*"([^"]+)''',
+            r'''window\.location\.href\s*=\s*"([^"]+)'''
+        ]
+        for pat in redirect_patterns:
+            redirect_match = re.search(pat, text)
+            if redirect_match:
+                if redirect_count >= 5:
+                    raise ExtractorError("VOE: too many redirects")
+                redirect_url = urljoin(url, redirect_match.group(1))
+                logger.info(f"VOE: redirecting to {redirect_url}")
+                return await self.extract(redirect_url, redirect_count=redirect_count + 1, **kwargs)
 
-        code_and_script_pattern = r'json">\["([^"]+)"]</script>\s*<script\s*src="([^"]+)'
-        code_and_script_match = re.search(code_and_script_pattern, text, re.DOTALL)
-        if not code_and_script_match:
-            raise ExtractorError("VOE: unable to locate obfuscated payload or external script URL")
+        all_texts = [text]
+        all_texts.extend(await self._fetch_external_scripts(url, text))
 
-        script_url = urljoin(url, code_and_script_match.group(2))
-        async with session.get(script_url) as script_response:
-            script_text = await script_response.text()
+        for combined_text in all_texts:
+            # 2. Try Method 8 (Obfuscated JSON inside <script type="application/json">)
+            json_matches = re.findall(r'<script[^>]*type="application/json"[^>]*>(.*?)</script>', combined_text, re.DOTALL)
+            simple_json_match = re.search(r'json">(\[[^\]]+\])</script>', combined_text)
+            if simple_json_match:
+                json_matches.append(simple_json_match.group(1))
+
+            for json_str in json_matches:
+                result = self._deobfuscate_method8(json_str.strip())
+                if result:
+                    final_url = result.get('source') or result.get('direct_access_url') or result.get('file')
+                    if final_url:
+                        logger.info("VOE: successfully extracted URL via Method 8")
+                        self.base_headers["referer"] = url
+                        return {
+                            "destination_url": final_url,
+                            "request_headers": self.base_headers,
+                            "mediaflow_endpoint": "hls_proxy",
+                            "selected_proxy": self.last_used_proxy,
+                            "force_direct": self._force_direct,
+                            "bypass_warp": self.bypass_warp_active,
+                        }
+
+            # 3. Try Method 7 (MKGMa)
+            mkgma_match = re.search(r'MKGMa="([^"]+)"', combined_text)
+            if mkgma_match:
+                result = self._deobfuscate_method7(mkgma_match.group(1))
+                if result:
+                    final_url = result.get('source') or result.get('direct_access_url') or result.get('file')
+                    if final_url:
+                        logger.info("VOE: successfully extracted URL via Method 7")
+                        self.base_headers["referer"] = url
+                        return {
+                            "destination_url": final_url,
+                            "request_headers": self.base_headers,
+                            "mediaflow_endpoint": "hls_proxy",
+                            "selected_proxy": self.last_used_proxy,
+                            "force_direct": self._force_direct,
+                            "bypass_warp": self.bypass_warp_active,
+                        }
+
+            # 4. Try Method 6 (a168c)
+            a168c_match = re.search(r"a168c\s*=\s*'([^']+)'", combined_text)
+            if a168c_match:
+                result = self._deobfuscate_method6(a168c_match.group(1))
+                if result:
+                    final_url = result.get('source') or result.get('direct_access_url') or result.get('file')
+                    if final_url:
+                        logger.info("VOE: successfully extracted URL via Method 6")
+                        self.base_headers["referer"] = url
+                        return {
+                            "destination_url": final_url,
+                            "request_headers": self.base_headers,
+                            "mediaflow_endpoint": "hls_proxy",
+                            "selected_proxy": self.last_used_proxy,
+                            "force_direct": self._force_direct,
+                            "bypass_warp": self.bypass_warp_active,
+                        }
+
+            # 5. Legacy Obfuscated (using external script for LUTs)
+            code_and_script_pattern = r'json">\["([^"]+)"]</script>\s*<script\s*src="([^"]+)'
+            code_and_script_match = re.search(code_and_script_pattern, combined_text, re.DOTALL)
+            if code_and_script_match:
+                try:
+                    return await self._extract_obfuscated(url, combined_text, code_and_script_match)
+                except Exception as e:
+                    logger.warning(f"VOE: legacy obfuscated extraction failed: {e}")
+
+        # 6. Direct extractors fallback (search all collected text)
+        for combined_text in all_texts:
+            # Check for var source = '...' (direct mp4)
+            m = re.search(r"var\s+source\s*=\s*'([^']+)'", combined_text)
+            if m:
+                final_url = m.group(1)
+                self.base_headers["referer"] = url
+                return {
+                    "destination_url": final_url,
+                    "request_headers": self.base_headers,
+                    "mediaflow_endpoint": "hls_proxy",
+                    "selected_proxy": self.last_used_proxy,
+                    "force_direct": self._force_direct,
+                    "bypass_warp": self.bypass_warp_active,
+                }
+            # Check for hls source
+            m = re.search(r"""hls['"]:\s*['"]([^'"]+)""", combined_text)
+            if m:
+                final_url = m.group(1)
+                self.base_headers["referer"] = url
+                return {
+                    "destination_url": final_url,
+                    "request_headers": self.base_headers,
+                    "mediaflow_endpoint": "hls_proxy",
+                    "selected_proxy": self.last_used_proxy,
+                    "force_direct": self._force_direct,
+                    "bypass_warp": self.bypass_warp_active,
+                }
+
+        logger.warning(f"VOE: no pattern matched for {url}")
+        raise ExtractorError(f"VOE: unable to locate obfuscated payload or external script URL [{url}]")
+
+    async def _extract_obfuscated(self, url: str, text: str, match: re.Match) -> dict:
+        script_url = urljoin(url, match.group(2))
+        resp_script = await self._make_request(script_url)
+        script_text = resp_script.text
 
         luts_pattern = r"(\[(?:'\W{2}'[,\]]){1,9})"
         luts_match = re.search(luts_pattern, script_text, re.DOTALL)
         if not luts_match:
             raise ExtractorError("VOE: unable to locate LUTs in external script")
 
-        data = self.voe_decode(code_and_script_match.group(1), luts_match.group(1))
+        data = self.voe_decode(match.group(1), luts_match.group(1))
 
         final_url = data.get('source')
         if not final_url:
@@ -75,7 +172,86 @@ class VoeExtractor:
             "destination_url": final_url,
             "request_headers": self.base_headers,
             "mediaflow_endpoint": "hls_proxy",
+            "selected_proxy": self.last_used_proxy,
+            "force_direct": self._force_direct,
+            "bypass_warp": self.bypass_warp_active,
         }
+
+    @staticmethod
+    def _rot13(text: str) -> str:
+        out = []
+        for ch in text:
+            o = ord(ch)
+            if 65 <= o <= 90:
+                out.append(chr(((o - 65 + 13) % 26) + 65))
+            elif 97 <= o <= 122:
+                out.append(chr(((o - 97 + 13) % 26) + 97))
+            else:
+                out.append(ch)
+        return ''.join(out)
+
+    @staticmethod
+    def _safe_b64_decode(s: str) -> str:
+        s = s.replace('\\', '')
+        pad = len(s) % 4
+        if pad:
+            s += '=' * (4 - pad)
+        try:
+            return base64.b64decode(s).decode('utf-8', errors='replace')
+        except Exception:
+            return ""
+
+    @staticmethod
+    def _shift_chars(text: str, shift: int) -> str:
+        return ''.join(chr(ord(c) - shift) for c in text)
+
+    def _deobfuscate_method8(self, raw_json: str) -> dict:
+        try:
+            arr = json.loads(raw_json)
+            if not (isinstance(arr, list) and arr and isinstance(arr[0], str)):
+                return {}
+            obf = arr[0]
+        except Exception:
+            if raw_json.startswith('["') and raw_json.endswith('"]'):
+                obf = raw_json[2:-2]
+            else:
+                return {}
+
+        try:
+            step1 = self._rot13(obf)
+            step2 = step1
+            for pat in ['@$', '^^', '~@', '%?', '*~', '!!', '#&']:
+                step2 = step2.replace(pat, '')
+            step3 = self._safe_b64_decode(step2)
+            step4 = self._shift_chars(step3, 3)
+            step5 = step4[::-1]
+            step6 = self._safe_b64_decode(step5)
+            return json.loads(step6)
+        except Exception as e:
+            logger.debug(f"VOE: deobfuscate Method 8 failed: {e}")
+            return {}
+
+    def _deobfuscate_method7(self, raw_mkgma: str) -> dict:
+        try:
+            step1 = self._rot13(raw_mkgma)
+            step2 = step1.replace('_', '')
+            step3 = self._safe_b64_decode(step2)
+            step4 = self._shift_chars(step3, 3)
+            step5 = step4[::-1]
+            step6 = self._safe_b64_decode(step5)
+            return json.loads(step6)
+        except Exception as e:
+            logger.debug(f"VOE: deobfuscate Method 7 failed: {e}")
+            return {}
+
+    def _deobfuscate_method6(self, raw_base64: str) -> dict:
+        try:
+            cleaned = re.sub(r'\s+', '', raw_base64)
+            decoded = self._safe_b64_decode(cleaned)[::-1]
+            return json.loads(decoded)
+        except Exception as e:
+            logger.debug(f"VOE: deobfuscate Method 6 failed: {e}")
+            return {}
 
     @staticmethod
     def voe_decode(ct: str, luts: str) -> dict:
@@ -96,5 +272,4 @@ class VoeExtractor:
         return json.loads(txt)
 
     async def close(self):
-        if self.session and not self.session.closed:
-            await self.session.close()
+        await super().close()
